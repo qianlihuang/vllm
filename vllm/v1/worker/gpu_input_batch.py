@@ -253,6 +253,10 @@ class InputBatch:
         # Store last speculative tokens for sampler.
         self.spec_token_ids: list[list[int]] = [[] for _ in range(max_num_reqs)]
 
+        self.min_tokens_cpu = np.zeros(max_num_reqs, dtype=np.int32)
+        self.all_stop_token_ids: dict[int, set[int]] = {}
+        self.min_tokens_reqs: set[str] = set()
+
         # This is updated each time the batch constituents change.
         self.sampling_metadata = self._make_sampling_metadata()
 
@@ -410,6 +414,13 @@ class InputBatch:
                 self.bad_words_token_ids[req_index] = (
                     sampling_params.bad_words_token_ids
                 )
+
+            if sampling_params.min_tokens > 0:
+                self.min_tokens_cpu[req_index] = sampling_params.min_tokens
+                self.all_stop_token_ids[req_index] = sampling_params.all_stop_token_ids
+                self.min_tokens_reqs.add(req_id)
+            else:
+                self.min_tokens_cpu[req_index] = 0
         elif pooling_params := request.pooling_params:
             pooling_states = request.pooling_states
             assert pooling_states is not None
@@ -518,6 +529,11 @@ class InputBatch:
             # False means we don't fill with -inf.
             self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
         self.bad_words_token_ids.pop(req_index, None)
+
+        self.min_tokens_reqs.discard(req_id)
+        self.min_tokens_cpu[req_index] = 0
+        self.all_stop_token_ids.pop(req_index, None)
+
         return req_index
 
     def swap_states(self, i1: int, i2: int) -> None:
@@ -613,6 +629,12 @@ class InputBatch:
 
         swap_dict_values(self.generators, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
+
+        self.min_tokens_cpu[i1], self.min_tokens_cpu[i2] = (
+            self.min_tokens_cpu[i2],
+            self.min_tokens_cpu[i1],
+        )
+        swap_dict_values(self.all_stop_token_ids, i1, i2)
 
         if self.allowed_token_ids_mask_cpu_tensor is not None:
             (
@@ -745,6 +767,11 @@ class InputBatch:
             if bad_words_token_ids is not None:
                 self.bad_words_token_ids[empty_index] = bad_words_token_ids
 
+            self.min_tokens_cpu[empty_index] = self.min_tokens_cpu[last_req_index]
+            all_stop = self.all_stop_token_ids.pop(last_req_index, None)
+            if all_stop is not None:
+                self.all_stop_token_ids[empty_index] = all_stop
+
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
 
@@ -835,6 +862,18 @@ class InputBatch:
             )
             allowed_token_ids_mask = self.allowed_token_ids_mask[:num_reqs]
 
+        min_tokens: list[int] | None = None
+        all_stop_token_ids_list: list[set[int]] | None = None
+        prompt_lens: list[int] | None = None
+        if self.is_spec_decode and self.min_tokens_reqs:
+            min_tokens = [int(self.min_tokens_cpu[i]) for i in range(num_reqs)]
+            all_stop_token_ids_list = [
+                self.all_stop_token_ids.get(i, set()) for i in range(num_reqs)
+            ]
+            prompt_lens = [int(self.num_prompt_tokens[i]) for i in range(num_reqs)]
+            if not output_token_ids:
+                output_token_ids = cast(list[list[int]], self.req_output_token_ids)
+
         return SamplingMetadata(
             temperature=temperature,
             all_greedy=self.all_greedy,
@@ -853,6 +892,9 @@ class InputBatch:
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
+            min_tokens=min_tokens,
+            all_stop_token_ids=all_stop_token_ids_list,
+            prompt_lens=prompt_lens,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

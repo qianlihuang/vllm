@@ -202,8 +202,8 @@ def build_logitsprocs(
         if custom_logitsprocs:
             raise ValueError(STR_SPEC_DEC_REJECTS_LOGITSPROCS)
         logger.warning(
-            "min_p, logit_bias, and min_tokens parameters won't currently work "
-            "with speculative decoding enabled."
+            "min_p and logit_bias parameters won't work with speculative decoding. "
+            "min_tokens is handled directly in the rejection sampler."
         )
         return LogitsProcessors()
 

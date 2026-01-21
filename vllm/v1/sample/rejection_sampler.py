@@ -294,6 +294,61 @@ class RejectionSampler(nn.Module):
                 logits, bad_words_token_ids, output_token_ids, metadata.num_draft_tokens
             )
 
+        logits = self._apply_min_tokens(logits, sampling_metadata, metadata)
+
+        return logits
+
+    def _apply_min_tokens(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        metadata: SpecDecodeMetadata,
+    ) -> torch.Tensor:
+        """Apply min_tokens constraint by masking stop tokens with -inf.
+
+        For each draft token position, check if the request has reached the
+        min_tokens threshold. If not, mask all stop tokens (EOS + custom stop
+        token IDs) with -inf to prevent early stopping.
+        """
+        min_tokens = sampling_metadata.min_tokens
+        all_stop_token_ids = sampling_metadata.all_stop_token_ids
+        output_token_ids = sampling_metadata.output_token_ids
+
+        if min_tokens is None or all_stop_token_ids is None:
+            return logits
+
+        if not any(mt > 0 for mt in min_tokens):
+            return logits
+
+        num_draft_tokens = metadata.num_draft_tokens
+        device = logits.device
+
+        logit_idx = 0
+        for req_idx, n_draft in enumerate(num_draft_tokens):
+            min_tok = min_tokens[req_idx]
+            if min_tok <= 0:
+                logit_idx += n_draft
+                continue
+
+            current_output_len = len(output_token_ids[req_idx])
+            stop_tokens = all_stop_token_ids[req_idx]
+
+            if not stop_tokens:
+                logit_idx += n_draft
+                continue
+
+            stop_token_tensor = torch.tensor(
+                list(stop_tokens), device=device, dtype=torch.long
+            )
+
+            for draft_pos in range(n_draft):
+                effective_output_len = current_output_len + draft_pos
+
+                if effective_output_len < min_tok:
+                    logits[logit_idx + draft_pos, stop_token_tensor] = float("-inf")
+
+            logit_idx += n_draft
+
         return logits
 
     @staticmethod

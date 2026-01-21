@@ -42,3 +42,7 @@ class SamplingMetadata:
 
     # Speculative token ids
     spec_token_ids: list[list[int]] | None = None
+
+    min_tokens: list[int] | None = None
+    all_stop_token_ids: list[set[int]] | None = None
+    prompt_lens: list[int] | None = None
