@@ -631,7 +631,7 @@ class FusedMoE(CustomOp):
     def maybe_init_modular_kernel(self) -> None:
         # NOTE(rob): WIP refactor. For quant methods that own the MK
         # we create the MK during process_weights_after_loading.
-        if self.quant_method.supports_internal_mk or self.quant_method.is_monolithic:
+        if self.quant_method.supports_internal_mk:
             return None
 
         self.ensure_moe_quant_config_init()
@@ -1777,7 +1777,8 @@ class FusedMoE(CustomOp):
         # NOTE(rob): once we finish migrating all the quant methods to use
         # MKs, we can remove the naive dispatch/combine path from here.
         do_naive_dispatch_combine = (
-            self.dp_size > 1 and not self.quant_method.supports_internal_mk
+            self.dp_size > 1
+            and not isinstance(self.quant_method, FusedMoEModularMethod)
         )
 
         ctx = get_forward_context()
