@@ -12,8 +12,6 @@ from vllm.platforms import current_platform
 class GateLinear(ReplicatedLinear):
     """MoE gate linear layer with multi-tier GEMM dispatch:
 
-"""MoE gate linear layer with multi-tier GEMM dispatch:
-
     1. DSV3 specialized kernel (SM90+, fp32 out, M<=16, H=7168, E=256/384)
     2. fp32 specialized kernel  (SM90+, fp32 in/out, M<=32, H=3072, E=256)
     3. gpt-oss specialized kernel (SM90+, bf16, M<=128, H=2880, E=32/128)
@@ -135,9 +133,10 @@ class GateLinear(ReplicatedLinear):
             return output, None
 
         # Tier 2: fp32 specialized kernel (H=3072, E=256, M<=32)
-        # Accepts bf16 or fp32 activation; conversion to fp32 done in kernel.
-        if self.allow_fp32_router_gemm and x.shape[0] <= self.FP32_MAX_TOKENS:
-            output = ops.fp32_router_gemm(x, self.weight)
+        # Dispatch is wrapped in a custom op so that torch.compile/CUDA-graph
+        # capture does not freeze the runtime num_tokens branch.
+        if self.allow_fp32_router_gemm:
+            output = torch.ops.vllm.fp32_router_gemm_dispatch(x, self.weight)
             return output, None
 
         # Tier 3: gpt-oss specialized kernel
@@ -157,3 +156,50 @@ class GateLinear(ReplicatedLinear):
         if self.out_dtype is not None and output.dtype != self.out_dtype:
             output = output.to(self.out_dtype)
         return output, output_bias
+
+
+_FP32_ROUTER_GEMM_MAX_TOKENS = GateLinear.FP32_MAX_TOKENS
+
+
+def fp32_router_gemm_dispatch_impl(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    if x.shape[0] <= _FP32_ROUTER_GEMM_MAX_TOKENS:
+        return ops.fp32_router_gemm(x, weight)
+    else:
+        return torch.nn.functional.linear(x.float(), weight)
+
+
+def fp32_router_gemm_dispatch_fake(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="fp32_router_gemm_dispatch",
+    op_func=fp32_router_gemm_dispatch_impl,
+    fake_impl=fp32_router_gemm_dispatch_fake,
+)
+
+
+def gpt_oss_router_gemm_impl(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    if x.shape[0] <= 128:
+        return ops.gpt_oss_router_gemm(x, weight, bias)
+    else:
+        return torch.nn.functional.linear(x, weight, bias)
+
+
+def gpt_oss_router_gemm_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="gpt_oss_router_gemm",
+    op_func=gpt_oss_router_gemm_impl,
+    fake_impl=gpt_oss_router_gemm_fake,
+)
