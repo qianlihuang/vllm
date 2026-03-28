@@ -10,11 +10,15 @@ from vllm.platforms import current_platform
 
 @PluggableLayer.register("gate_linear")
 class GateLinear(ReplicatedLinear):
-    """MoE gate linear layer with three-tier GEMM dispatch:
+    """MoE gate linear layer with multi-tier GEMM dispatch:
 
-    1. DSV3 specialized kernel (SM90+, batch<=16, supported dims)
-    2. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 + fp32 out_dtype)
-    3. F.linear via ReplicatedLinear (ultimate fallback)
+"""MoE gate linear layer with multi-tier GEMM dispatch:
+
+    1. DSV3 specialized kernel (SM90+, fp32 out, M<=16, H=7168, E=256/384)
+    2. fp32 specialized kernel  (SM90+, fp32 in/out, M<=32, H=3072, E=256)
+    3. gpt-oss specialized kernel (SM90+, bf16, M<=128, H=2880, E=32/128)
+    4. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
+    5. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
     (e.g. when the required dtype depends on the expert quantization
@@ -131,6 +135,7 @@ class GateLinear(ReplicatedLinear):
             return output, None
 
         # Tier 2: fp32 specialized kernel (H=3072, E=256, M<=32)
+        # Accepts bf16 or fp32 activation; conversion to fp32 done in kernel.
         if self.allow_fp32_router_gemm and x.shape[0] <= self.FP32_MAX_TOKENS:
             output = ops.fp32_router_gemm(x, self.weight)
             return output, None
