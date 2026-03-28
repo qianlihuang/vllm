@@ -131,6 +131,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "dsv4_norm_router_gemm(Tensor! logits, Tensor! normed_x, Tensor x, "
       "Tensor norm_weight, Tensor gate_weight, float eps) -> ()");
   // conditionally compiled so impl registration is in source file
+
+  // gpt-oss optimized router GEMM kernel for SM90+
+  m.def(
+      "gpt_oss_router_gemm(Tensor! output, Tensor input, Tensor weights, "
+      "Tensor bias) -> ()");
+  m.impl("gpt_oss_router_gemm", torch::kCUDA, &gpt_oss_router_gemm);
+
+  // FP32 x FP32 -> FP32 router GEMM for H=3072, E=256, M<=32 (SM90+)
+  m.def("fp32_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+  // impl registration is in fp32_router_gemm_entry.cu
 #endif
 }
 
