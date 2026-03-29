@@ -88,7 +88,7 @@ void dsv4_norm_router_gemm(at::Tensor& logits, at::Tensor& normed_x,
 void gpt_oss_router_gemm(torch::Tensor& output, torch::Tensor input,
                          torch::Tensor weight, torch::Tensor bias);
 
-// FP32 x FP32 -> FP32 router GEMM for H=3072, E=256, M<=32 (SM90+)
+// FP16 x FP32 -> FP32 router GEMM for H=3072, E=256, M<=32 (SM90+)
 void fp32_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a,
                       const torch::Tensor& mat_b);
 #endif
