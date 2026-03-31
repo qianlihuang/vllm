@@ -368,6 +368,141 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       " -> ()");
   // conditionally compiled so impl registration is in source file
 
+  // CUTLASS w8a8 GEMM, supporting symmetric per-tensor or per-row/column
+  // quantization, as well as bias
+  ops.def(
+      "cutlass_scaled_mm(Tensor! out, Tensor a,"
+      "                  Tensor b, Tensor a_scales,"
+      "                  Tensor b_scales, Tensor? bias) -> ()");
+  ops.impl("cutlass_scaled_mm", torch::kCUDA, &cutlass_scaled_mm);
+
+  // CUTLASS w8a8 GEMM, supporting asymmetric per-tensor or per-row/column
+  // quantization.
+  ops.def(
+      "cutlass_scaled_mm_azp(Tensor! out, Tensor a,"
+      "                  Tensor b, Tensor a_scales,"
+      "                  Tensor b_scales, Tensor azp_adj,"
+      "                  Tensor? azp, Tensor? bias) -> ()");
+  ops.impl("cutlass_scaled_mm_azp", torch::kCUDA, &cutlass_scaled_mm_azp);
+
+  // Check if cutlass scaled_mm is supported for CUDA devices of the given
+  // capability
+  ops.def("cutlass_scaled_mm_supports_fp8(int cuda_device_capability) -> bool");
+  ops.impl("cutlass_scaled_mm_supports_fp8", &cutlass_scaled_mm_supports_fp8);
+
+  // Check if cutlass grouped gemm is supported for CUDA devices of the given
+  // capability
+  ops.def("cutlass_group_gemm_supported(int cuda_device_capability) -> bool");
+  ops.impl("cutlass_group_gemm_supported", &cutlass_group_gemm_supported);
+
+  // CUTLASS w8a8 grouped GEMM
+  ops.def(
+      "cutlass_moe_mm(Tensor! out_tensors, Tensor a_tensors, Tensor b_tensors, "
+      "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
+      "               Tensor problem_sizes, Tensor a_strides, "
+      "               Tensor b_strides, Tensor c_strides, bool per_act_token, "
+      "               bool per_out_ch) -> ()");
+  ops.impl("cutlass_moe_mm", torch::kCUDA, &cutlass_moe_mm);
+
+  // A function that computes data required to run fused MoE with w8a8 grouped
+  // GEMM. It takes topk_ids as an input, and computes expert_offsets
+  // (token start indices of each expert). In addition to this, it computes
+  // problem sizes for each expert's multiplication used by the two mms called
+  // from fused MoE operation, and arrays with permutations required to shuffle
+  // and de-shuffle the input/output of the fused operation.
+  ops.def(
+      "get_cutlass_moe_mm_data(Tensor topk_ids, Tensor! expert_offsets, "
+      "                        Tensor! problem_sizes1, Tensor! problem_sizes2, "
+      "                        Tensor! input_permutation, "
+      "                        Tensor! output_permutation, int num_experts, "
+      "                        int n, int k, Tensor? blockscale_offsets, "
+      "                        bool is_gated) -> ()");
+  ops.impl("get_cutlass_moe_mm_data", torch::kCUDA, &get_cutlass_moe_mm_data);
+
+  // compute per-expert problem sizes from expert_first_token_offset
+  // produced by vLLM's moe_permute kernel
+  ops.def(
+      "get_cutlass_moe_mm_problem_sizes_from_expert_offsets("
+      "    Tensor expert_first_token_offset, "
+      "    Tensor! problem_sizes1, "
+      "    Tensor! problem_sizes2, "
+      "    int n, int k, bool swap_ab) -> ()");
+  ops.impl("get_cutlass_moe_mm_problem_sizes_from_expert_offsets", torch::kCUDA,
+           &get_cutlass_moe_mm_problem_sizes_from_expert_offsets);
+
+  // A function that computes data required to run fused MoE with w8a8 grouped
+  // GEMM in batched expert format. It takes expert_num_tokens
+  // as an input, and computes expert_offsets (token start indices of each
+  // expert). In addition to this, it computes problem sizes for each expert's
+  // multiplication used by the two mms called from fused MoE operation.
+  ops.def(
+      "get_cutlass_batched_moe_mm_data(Tensor! expert_offsets, "
+      "                             Tensor! problem_sizes1, "
+      "                             Tensor! problem_sizes2, "
+      "                             Tensor expert_num_tokens, "
+      "                             int num_local_experts, int padded_m, "
+      "                             int n, int k) -> ()");
+  ops.impl("get_cutlass_batched_moe_mm_data", torch::kCUDA,
+           &get_cutlass_batched_moe_mm_data);
+
+  // Check if cutlass scaled_mm supports block quantization (used by DeepSeekV3)
+  ops.def(
+      "cutlass_scaled_mm_supports_block_fp8(int cuda_device_capability) -> "
+      "bool");
+  ops.impl("cutlass_scaled_mm_supports_block_fp8",
+           &cutlass_scaled_mm_supports_block_fp8);
+
+  // SM100 CUTLASS MLA decode
+  ops.def(
+      "sm100_cutlass_mla_decode(Tensor! out, Tensor! lse, Tensor q_nope,"
+      "                         Tensor q_pe, Tensor kv_c_and_k_pe_cache,"
+      "                         Tensor seq_lens, Tensor page_table,"
+      "                         Tensor workspace, float scale,"
+      "                         int num_kv_splits) -> ()");
+  // conditionally compiled so impl in source file
+
+  // SM100 CUTLASS MLA workspace
+  ops.def(
+      "sm100_cutlass_mla_get_workspace_size(int max_seq_len, int num_batches,"
+      "                                     int sm_count, int num_kv_splits) "
+      "-> int");
+  // conditionally compiled so impl in source file
+
+  // Compute NVFP4 block quantized tensor.
+  ops.def(
+      "scaled_fp4_quant(Tensor input,"
+      "                 Tensor input_scale, bool "
+      "is_sf_swizzled_layout, bool enable_pdl=False) -> (Tensor, Tensor)");
+  ops.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant_func);
+
+  // Out variant
+  ops.def(
+      "scaled_fp4_quant.out(Tensor input,"
+      "                     Tensor input_scale, bool "
+      "is_sf_swizzled_layout, *, Tensor(a!) output, Tensor(b!) output_scale, "
+      "bool enable_pdl=False) -> ()");
+  ops.impl("scaled_fp4_quant.out", torch::kCUDA, &scaled_fp4_quant_out);
+
+  // Compute NVFP4 experts quantization.
+  ops.def(
+      "scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
+      "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
+      "Tensor output_scale_offset_by_experts) -> ()");
+  ops.impl("scaled_fp4_experts_quant", torch::kCUDA, &scaled_fp4_experts_quant);
+
+  // Fused SiLU+Mul+NVFP4 experts quantization.
+  ops.def(
+      "silu_and_mul_scaled_fp4_experts_quant(Tensor! output, Tensor! "
+      "output_scale,"
+      "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
+      "Tensor output_scale_offset_by_experts) -> ()");
+  ops.impl("silu_and_mul_scaled_fp4_experts_quant", torch::kCUDA,
+           &silu_and_mul_scaled_fp4_experts_quant);
+
+  // Check if cutlass_scaled_mm_fp4 is supported for CUDA devices
+  // of the given capability
+  ops.def("cutlass_scaled_mm_supports_fp4(int cuda_device_capability) -> bool");
+  ops.impl("cutlass_scaled_mm_supports_fp4", &cutlass_scaled_mm_supports_fp4);
 #endif
 
   // Quantized GEMM for GPTQ.

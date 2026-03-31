@@ -106,6 +106,7 @@ if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "scaled_fp4_quant"):
         *,
         output: torch.Tensor,
         output_scale: torch.Tensor,
+        enable_pdl: bool = False,
     ) -> None:
         return None
 
@@ -1603,6 +1604,7 @@ def scaled_fp4_quant(
     is_sf_swizzled_layout: bool = True,
     backend: str = "none",
     padded_n: int | None = None,
+    enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize input tensor to FP4 and return quantized tensor and scale.
@@ -1665,6 +1667,7 @@ def scaled_fp4_quant(
             is_sf_swizzled_layout,
             output=output,
             output_scale=output_scale,
+            enable_pdl=enable_pdl,
         )
 
     output_scale = output_scale.view(torch.float8_e4m3fn)
