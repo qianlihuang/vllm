@@ -2431,6 +2431,7 @@ def topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> None:
     torch.ops._moe_C.topk_softmax(
         topk_weights,
@@ -2439,6 +2440,7 @@ def topk_softmax(
         gating_output,
         renormalize,
         e_score_correction_bias,
+        enable_pdl,
     )
 
 
@@ -2449,6 +2451,7 @@ def topk_sigmoid(
     gating_output: torch.Tensor,
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> None:
     torch.ops._moe_C.topk_sigmoid(
         topk_weights,
@@ -2457,6 +2460,7 @@ def topk_sigmoid(
         gating_output,
         renormalize,
         e_score_correction_bias,
+        enable_pdl,
     )
 
 
