@@ -106,7 +106,9 @@ class OpenAIServingRender:
         self.log_error_stack = log_error_stack
         self.use_harmony = model_config.hf_config.model_type == "gpt_oss"
         self.supports_browsing = False
+        self.browser_tool = None
         self.supports_code_interpreter = False
+        self.python_tool = None
 
         self.default_sampling_params = model_config.get_diff_sampling_param()
         mc = model_config
@@ -389,13 +391,12 @@ class OpenAIServingRender:
         # Add system message.
         # NOTE: In Chat Completion API, browsing is enabled by default
         # if the model supports it. TODO: Support browsing.
-        assert not self.supports_browsing
         assert not self.supports_code_interpreter
         if (reasoning_effort := request.reasoning_effort) == "none":
             raise ValueError(f"Harmony does not support {reasoning_effort=}")
         sys_msg = get_system_message(
             reasoning_effort=reasoning_effort,
-            browser_description=None,
+            browser_description=self.browser_tool if self.supports_browsing else None,
             python_description=None,
             with_custom_tools=should_include_tools,
         )

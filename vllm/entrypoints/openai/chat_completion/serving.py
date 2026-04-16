@@ -82,6 +82,7 @@ from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer
 
 if TYPE_CHECKING:
+    from vllm.entrypoints.mcp.tool_server import ToolServer
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
@@ -109,6 +110,7 @@ class OpenAIServingChat(OpenAIServing):
         enable_log_outputs: bool = False,
         enable_log_deltas: bool = True,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        tool_server: "ToolServer | None" = None,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -125,6 +127,7 @@ class OpenAIServingChat(OpenAIServing):
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self.enable_log_outputs = enable_log_outputs
         self.enable_log_deltas = enable_log_deltas
+        self.tool_server = tool_server
 
         # set up reasoning parser
         self.reasoning_parser_cls = ParserManager.get_reasoning_parser(
@@ -170,15 +173,30 @@ class OpenAIServingChat(OpenAIServing):
 
         self.tool_call_id_type = get_tool_call_id_type(self.model_config)
 
-        # NOTE(woosuk): While OpenAI's chat completion API supports browsing
-        # for some models, currently vLLM doesn't support it. Please use the
-        # Responses API instead.
-        self.supports_browsing = False
-        self.browser_tool = None
+        # Chat Completions can include Harmony's browser tool only when an MCP
+        # browser server is configured and available.
+        self.supports_browsing = (
+            self.use_harmony
+            and self.tool_server is not None
+            and self.tool_server.has_tool("browser")
+        )
+        self.browser_tool = (
+            self.tool_server.get_tool_description("browser")
+            if self.supports_browsing and self.tool_server is not None
+            else None
+        )
         # NOTE(woosuk): Chat completion API does not support code interpreter.
         # Please use the Responses API instead.
         self.supports_code_interpreter = False
         self.python_tool = None
+
+        # Keep the shared render helper in sync with the API-layer capabilities.
+        self.openai_serving_render.supports_browsing = self.supports_browsing
+        self.openai_serving_render.browser_tool = self.browser_tool
+        self.openai_serving_render.supports_code_interpreter = (
+            self.supports_code_interpreter
+        )
+        self.openai_serving_render.python_tool = self.python_tool
 
     def warmup(self) -> None:
         self.renderer.warmup(

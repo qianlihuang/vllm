@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from openai import OpenAI
+from openai_harmony import ToolNamespaceConfig
 
 from tests.entrypoints.openai.utils import (
     accumulate_streaming_response,
@@ -574,7 +575,10 @@ def _build_serving_render(
     )
 
 
-def _build_serving_chat(engine: AsyncLLM) -> OpenAIServingChat:
+def _build_serving_chat(
+    engine: AsyncLLM,
+    tool_server=None,
+) -> OpenAIServingChat:
     models = OpenAIServingModels(
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
@@ -589,6 +593,7 @@ def _build_serving_chat(engine: AsyncLLM) -> OpenAIServingChat:
         chat_template=CHAT_TEMPLATE,
         chat_template_content_format="auto",
         request_logger=None,
+        tool_server=tool_server,
     )
 
     return serving_chat
@@ -1203,6 +1208,7 @@ class TestServingChatWithHarmony:
                 {"role": "user", "content": messages[0]["content"]},
             ],
         )
+        assert not input_messages[0].content[0].tools
 
         # Test the Chat Completion response for the first turn's output
         reasoning_str = "We need to think really hard about this."
@@ -1235,6 +1241,28 @@ class TestServingChatWithHarmony:
                 {"role": "assistant", "channel": "final", "content": final_str},
             ],
         )
+
+    def test_harmony_system_message_includes_browser_tool_when_supported(
+        self, mock_engine
+    ):
+        tool_server = MagicMock()
+        tool_server.has_tool.side_effect = lambda name: name == "browser"
+        tool_server.get_tool_description.return_value = ToolNamespaceConfig.browser()
+        mock_engine.model_config.hf_config.model_type = "gpt_oss"
+
+        serving_chat = _build_serving_chat(mock_engine, tool_server=tool_server)
+
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "what is 1+1?"}],
+        )
+        input_messages, _ = serving_chat.openai_serving_render._make_request_with_harmony(
+            req
+        )
+
+        assert input_messages[0].author.role == "system"
+        assert input_messages[0].content[0].tools is not None
+        assert "browser" in input_messages[0].content[0].tools
 
     @pytest.mark.asyncio
     async def test_tool_call_response_with_content(
