@@ -15,6 +15,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     get_routing_method_type,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.layers.fused_moe.router.minimax_routing import (
+    _can_use_triton_minimax_routing,
+    minimax_triton_topk_sigmoid,
+)
 
 
 def vllm_topk_softmax(
@@ -141,14 +145,32 @@ def fused_topk_bias(
                 topk_weights *= routed_scaling_factor
             return topk_weights, topk_ids
         elif scoring_func == "sigmoid":
-            topk_weights, topk_ids = vllm_topk_sigmoid(
-                topk_weights,
-                topk_ids,
-                token_expert_indices,
-                gating_output,
-                renormalize,
-                e_score_correction_bias,
-            )
+            if _can_use_triton_minimax_routing(
+                gating_output=gating_output,
+                scoring_func=scoring_func,
+                topk=topk,
+                renormalize=renormalize,
+                e_score_correction_bias=e_score_correction_bias,
+            ):
+                topk_weights, topk_ids, token_expert_indices = (
+                    minimax_triton_topk_sigmoid(
+                        topk_weights,
+                        topk_ids,
+                        token_expert_indices,
+                        gating_output,
+                        renormalize,
+                        e_score_correction_bias,
+                    )
+                )
+            else:
+                topk_weights, topk_ids = vllm_topk_sigmoid(
+                    topk_weights,
+                    topk_ids,
+                    token_expert_indices,
+                    gating_output,
+                    renormalize,
+                    e_score_correction_bias,
+                )
             if routed_scaling_factor != 1.0:
                 topk_weights *= routed_scaling_factor
             return topk_weights, topk_ids
