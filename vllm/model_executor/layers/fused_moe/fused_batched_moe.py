@@ -4,7 +4,6 @@
 
 import torch
 
-import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -931,41 +930,24 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
 
         intermediate_cache2.fill_(0)
 
-        # Fuse SiLU+Mul + FP8 block quantize into a single kernel
-        # when conditions permit (gated SiLU, fp8 block quant with group_size=128).
-        if (
-            activation == MoEActivation.SILU
-            and self.quant_config.use_fp8_w8a8
-            and self.block_shape == [128, 128]
-        ):
-            flat_input = intermediate_cache1.view(-1, N)
-            qintermediate_cache2, a2q_scale = ops.silu_and_mul_per_block_quant(
-                flat_input,
-                group_size=128,
-                quant_dtype=current_platform.fp8_dtype(),
-            )
-            qintermediate_cache2 = qintermediate_cache2.view(
-                E, max_num_tokens, activation_out_dim
-            )
-            a2q_scale = normalize_batched_scales_shape(a2q_scale, E)
-        else:
-            self.activation(
-                activation,
-                intermediate_cache2.view(-1, activation_out_dim),
-                intermediate_cache1.view(-1, N),
-            )
+        # TODO (bnell): use triton utility from batched deep gemm.
+        self.activation(
+            activation,
+            intermediate_cache2.view(-1, activation_out_dim),
+            intermediate_cache1.view(-1, N),
+        )
 
-            qintermediate_cache2, a2q_scale = batched_moe_kernel_quantize_input(
-                intermediate_cache2,
-                a2_scale,
-                max_num_tokens,
-                E,
-                N,
-                expert_num_tokens,
-                self.quant_dtype,
-                self.per_act_token_quant,
-                self.block_shape,
-            )
+        qintermediate_cache2, a2q_scale = batched_moe_kernel_quantize_input(
+            intermediate_cache2,
+            a2_scale,
+            max_num_tokens,
+            E,
+            N,
+            expert_num_tokens,
+            self.quant_dtype,
+            self.per_act_token_quant,
+            self.block_shape,
+        )
 
         invoke_moe_batched_triton_kernel(
             A=qintermediate_cache2,
