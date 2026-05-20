@@ -6,6 +6,7 @@ from torch.nn.parameter import Parameter
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 @PluggableLayer.register("gate_linear")
@@ -14,9 +15,8 @@ class GateLinear(ReplicatedLinear):
 
     1. DSV3 specialized kernel (SM90+, fp32 out, M<=16, H=7168, E=256/384)
     2. fp32 specialized kernel  (SM90+, fp32 in/out, M<=32, H=3072, E=256)
-    3. gpt-oss specialized kernel (SM90+, bf16, M<=128, H=2880, E=32/128)
-    4. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
-    5. F.linear via ReplicatedLinear (ultimate fallback)
+    3. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
+    4. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
     (e.g. when the required dtype depends on the expert quantization
@@ -26,10 +26,6 @@ class GateLinear(ReplicatedLinear):
     # Dimensions supported by the DSV3 specialized kernel
     DSV3_SUPPORTED_NUM_EXPERTS = [256, 384]
     DSV3_SUPPORTED_HIDDEN_SIZES = [7168]
-
-    # Dimensions supported by the gpt-oss specialized kernel
-    GPT_OSS_SUPPORTED_NUM_EXPERTS = [32, 128]
-    GPT_OSS_SUPPORTED_HIDDEN_SIZES = [2880]
 
     # Dimensions supported by the fp32 specialized kernel
     FP32_SUPPORTED_NUM_EXPERTS = [256]
@@ -54,7 +50,7 @@ class GateLinear(ReplicatedLinear):
         )
 
         # If fp32 compute is required and no specialized kernel is available,
-        # store weights in fp32 so Tier 3 computes in fp32 natively.
+        # store weights in fp32 so the final fallback computes in fp32 natively.
         if force_fp32_compute and not can_use_specialized_kernels:
             params_dtype = torch.float32
 
@@ -74,15 +70,6 @@ class GateLinear(ReplicatedLinear):
             self.allow_specialized_router_gemm
             and output_size in self.DSV3_SUPPORTED_NUM_EXPERTS
             and input_size in self.DSV3_SUPPORTED_HIDDEN_SIZES
-        )
-
-        # gpt-oss specialized kernel eligibility (SM90+, exact dims)
-        self.allow_gpt_oss_router_gemm = (
-            self.weight.dtype == torch.bfloat16
-            and current_platform.is_cuda()
-            and is_hopper_or_blackwell
-            and output_size in self.GPT_OSS_SUPPORTED_NUM_EXPERTS
-            and input_size in self.GPT_OSS_SUPPORTED_HIDDEN_SIZES
         )
 
         # fp32 specialized kernel eligibility (SM90+, exact dims, fp32 weight)
@@ -140,17 +127,12 @@ class GateLinear(ReplicatedLinear):
             output = torch.ops.vllm.fp32_router_gemm_dispatch(x, self.weight)
             return output, None
 
-        # Tier 3: gpt-oss specialized kernel
-        if self.allow_gpt_oss_router_gemm:
-            output = torch.ops.vllm.gpt_oss_router_gemm(x, self.weight, self.bias)
-            return output, None
-
-        # Tier 4: cuBLAS bf16→fp32
+        # Tier 3: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return output, None
 
-        # Tier 5: F.linear (ReplicatedLinear)
+        # Tier 4: F.linear (ReplicatedLinear)
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
         output, output_bias = super().forward(x)
@@ -181,26 +163,4 @@ direct_register_custom_op(
     op_name="fp32_router_gemm_dispatch",
     op_func=fp32_router_gemm_dispatch_impl,
     fake_impl=fp32_router_gemm_dispatch_fake,
-)
-
-
-def gpt_oss_router_gemm_impl(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
-) -> torch.Tensor:
-    if x.shape[0] <= 128:
-        return ops.gpt_oss_router_gemm(x, weight, bias)
-    else:
-        return torch.nn.functional.linear(x, weight, bias)
-
-
-def gpt_oss_router_gemm_fake(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
-) -> torch.Tensor:
-    return x.new_empty((x.shape[0], weight.shape[0]))
-
-
-direct_register_custom_op(
-    op_name="gpt_oss_router_gemm",
-    op_func=gpt_oss_router_gemm_impl,
-    fake_impl=gpt_oss_router_gemm_fake,
 )
