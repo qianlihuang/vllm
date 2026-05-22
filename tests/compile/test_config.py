@@ -627,6 +627,43 @@ def test_cached_compilation_config(default_vllm_config):
     assert "torch.ops._C.static_scaled_fp8_quant.default(" in code
 
 
+@pytest.mark.parametrize(
+    ("fuse_rope_kvcache", "fuse_rope_kvcache_cat_mla"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_rope_kvcache_fusion_skips_corresponding_split_ops(
+    fuse_rope_kvcache: bool,
+    fuse_rope_kvcache_cat_mla: bool,
+):
+    compilation_config = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        use_inductor_graph_partition=False,
+        pass_config=PassConfig(
+            fuse_rope_kvcache=fuse_rope_kvcache,
+            fuse_rope_kvcache_cat_mla=fuse_rope_kvcache_cat_mla,
+        ),
+    )
+
+    compilation_config.set_splitting_ops_for_v1(
+        all2all_backend="naive",
+        data_parallel_size=1,
+    )
+
+    splitting_ops = compilation_config.splitting_ops
+    assert splitting_ops is not None
+    assert compilation_config.pass_config.fuse_rope_kvcache is fuse_rope_kvcache
+    assert (
+        compilation_config.pass_config.fuse_rope_kvcache_cat_mla
+        is fuse_rope_kvcache_cat_mla
+    )
+    assert ("vllm::unified_kv_cache_update" in splitting_ops) == (
+        not fuse_rope_kvcache
+    )
+    assert ("vllm::unified_mla_kv_cache_update" in splitting_ops) == (
+        not fuse_rope_kvcache_cat_mla
+    )
+
+
 def _create_vllm_config_for_validation(
     compilation_config: CompilationConfig,
 ) -> MagicMock:

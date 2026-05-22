@@ -148,12 +148,16 @@ def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
     """
     from vllm._aiter_ops import rocm_aiter_ops
 
+    compilation_config = cfg.compilation_config
+    kv_cache_update_is_split = (
+        compilation_config.splitting_ops_contain_unified_kv_cache_update()
+    )
     return (
         rocm_aiter_ops.is_enabled()
-        and cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
+        and compilation_config.is_custom_op_enabled("rotary_embedding")
         and (
-            cfg.compilation_config.use_inductor_graph_partition
-            or not cfg.compilation_config.splitting_ops_contain_kv_cache_update()
+            compilation_config.use_inductor_graph_partition
+            or not kv_cache_update_is_split
         )
     )
 
@@ -161,9 +165,13 @@ def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
 def enable_rope_kvcache_mla_fusion(cfg: "VllmConfig") -> bool:
     """Enable if use_inductor_graph_partition is enabled."""
 
+    compilation_config = cfg.compilation_config
+    mla_kv_cache_update_is_split = (
+        compilation_config.splitting_ops_contain_unified_mla_kv_cache_update()
+    )
     return (
-        cfg.compilation_config.use_inductor_graph_partition
-        or not cfg.compilation_config.splitting_ops_contain_kv_cache_update()
+        compilation_config.use_inductor_graph_partition
+        or not mla_kv_cache_update_is_split
     )
 
 
