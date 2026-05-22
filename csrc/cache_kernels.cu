@@ -500,6 +500,44 @@ __global__ void fused_rope_and_cache_flash_kernel(
   }
 }
 
+// Helper to launch the fused kernel from a nested type-dispatch context.
+// The kernel launch <<<>>> syntax inside deeply nested dispatch macro lambdas
+// can confuse nvcc; calling this plain function avoids that.
+template <typename qk_t, typename cos_sin_t>
+void launch_fused_rope_and_cache_flash_kernel(
+    qk_t* query_ptr, qk_t* key_ptr, const qk_t* value_ptr,
+    qk_t* key_cache_ptr, qk_t* value_cache_ptr,
+    const int64_t* slot_mapping, const int64_t* positions,
+    const cos_sin_t* cos_sin_cache, int rot_dim, int64_t query_stride,
+    int64_t key_stride, int64_t value_stride, int64_t query_head_stride,
+    int64_t key_head_stride, int64_t value_head_stride, int64_t block_stride,
+    int64_t page_stride, int64_t cache_head_stride, int num_q_heads,
+    int num_kv_heads, int head_size, int block_size, int num_cache_tokens,
+    const float* k_scale, const float* v_scale, int kv_scale_stride,
+    bool is_neox, dim3 grid, dim3 block, cudaStream_t stream) {
+  if (is_neox) {
+    fused_rope_and_cache_flash_kernel<qk_t, qk_t, cos_sin_t, true,
+                                       Fp8KVCacheDataType::kAuto>
+        <<<grid, block, 0, stream>>>(
+            query_ptr, key_ptr, value_ptr, key_cache_ptr, value_cache_ptr,
+            slot_mapping, positions, cos_sin_cache, rot_dim, query_stride,
+            key_stride, value_stride, query_head_stride, key_head_stride,
+            value_head_stride, block_stride, page_stride, cache_head_stride,
+            num_q_heads, num_kv_heads, head_size, block_size, num_cache_tokens,
+            k_scale, v_scale, kv_scale_stride);
+  } else {
+    fused_rope_and_cache_flash_kernel<qk_t, qk_t, cos_sin_t, false,
+                                       Fp8KVCacheDataType::kAuto>
+        <<<grid, block, 0, stream>>>(
+            query_ptr, key_ptr, value_ptr, key_cache_ptr, value_cache_ptr,
+            slot_mapping, positions, cos_sin_cache, rot_dim, query_stride,
+            key_stride, value_stride, query_head_stride, key_head_stride,
+            value_head_stride, block_stride, page_stride, cache_head_stride,
+            num_q_heads, num_kv_heads, head_size, block_size, num_cache_tokens,
+            k_scale, v_scale, kv_scale_stride);
+  }
+}
+
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_kernel(
     const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
@@ -1020,43 +1058,21 @@ void fused_rope_and_cache_flash(
     VLLM_DISPATCH_FLOATING_TYPES(
         cos_sin_cache.scalar_type(), "fused_rope_cache_cos_sin", [&] {
           using cos_sin_t = scalar_t;
-          if (is_neox) {
-            vllm::fused_rope_and_cache_flash_kernel<
-                qk_t, qk_t, cos_sin_t, true, Fp8KVCacheDataType::kAuto>
-                <<<grid, block, 0, stream>>>(
-                    query.data_ptr<qk_t>(), key.data_ptr<qk_t>(),
-                    value.data_ptr<qk_t>(), key_cache.data_ptr<qk_t>(),
-                    value_cache.data_ptr<qk_t>(),
-                    slot_mapping.data_ptr<int64_t>(),
-                    positions.data_ptr<int64_t>(),
-                    cos_sin_cache.data_ptr<cos_sin_t>(), rot_dim,
-                    query.stride(0), key.stride(0), value.stride(0),
-                    query.stride(1), key.stride(1), value.stride(1),
-                    key_cache.stride(0), key_cache.stride(1),
-                    key_cache.stride(2), num_q_heads, num_kv_heads, head_size,
-                    block_size, num_cache_tokens,
-                    reinterpret_cast<const float*>(k_scale.data_ptr()),
-                    reinterpret_cast<const float*>(v_scale.data_ptr()),
-                    kv_scale_stride);
-          } else {
-            vllm::fused_rope_and_cache_flash_kernel<
-                qk_t, qk_t, cos_sin_t, false, Fp8KVCacheDataType::kAuto>
-                <<<grid, block, 0, stream>>>(
-                    query.data_ptr<qk_t>(), key.data_ptr<qk_t>(),
-                    value.data_ptr<qk_t>(), key_cache.data_ptr<qk_t>(),
-                    value_cache.data_ptr<qk_t>(),
-                    slot_mapping.data_ptr<int64_t>(),
-                    positions.data_ptr<int64_t>(),
-                    cos_sin_cache.data_ptr<cos_sin_t>(), rot_dim,
-                    query.stride(0), key.stride(0), value.stride(0),
-                    query.stride(1), key.stride(1), value.stride(1),
-                    key_cache.stride(0), key_cache.stride(1),
-                    key_cache.stride(2), num_q_heads, num_kv_heads, head_size,
-                    block_size, num_cache_tokens,
-                    reinterpret_cast<const float*>(k_scale.data_ptr()),
-                    reinterpret_cast<const float*>(v_scale.data_ptr()),
-                    kv_scale_stride);
-          }
+          vllm::launch_fused_rope_and_cache_flash_kernel<qk_t, cos_sin_t>(
+              query.data_ptr<qk_t>(), key.data_ptr<qk_t>(),
+              value.data_ptr<qk_t>(), key_cache.data_ptr<qk_t>(),
+              value_cache.data_ptr<qk_t>(),
+              slot_mapping.data_ptr<int64_t>(),
+              positions.data_ptr<int64_t>(),
+              cos_sin_cache.data_ptr<cos_sin_t>(), rot_dim,
+              query.stride(0), key.stride(0), value.stride(0),
+              query.stride(1), key.stride(1), value.stride(1),
+              key_cache.stride(0), key_cache.stride(1),
+              key_cache.stride(2), num_q_heads, num_kv_heads, head_size,
+              block_size, num_cache_tokens,
+              reinterpret_cast<const float*>(k_scale.data_ptr()),
+              reinterpret_cast<const float*>(v_scale.data_ptr()),
+              kv_scale_stride, is_neox, grid, block, stream);
         });
   });
 }
