@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -43,6 +44,20 @@ _KV_CACHE_LAYOUT_OVERRIDE: KVCacheLayoutType | None = None
 
 PAD_SLOT_ID = -1
 NULL_BLOCK_ID = 0
+
+
+def supports_cuda_hopper_rope_kvcache_fusion(
+    attn_type: str,
+    kv_sharing_target_layer_name: str | None,
+    kv_cache_dtype: str,
+) -> bool:
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(90)
+        and attn_type == "decoder"
+        and kv_sharing_target_layer_name is None
+        and kv_cache_dtype == "auto"
+    )
 
 
 def is_valid_kv_cache_layout(value: str) -> bool:

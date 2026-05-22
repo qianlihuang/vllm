@@ -108,6 +108,7 @@ class RopeReshapeKVCachePattern:
         self,
         layer: Attention,
         is_neox: bool,
+        rotary_dim: int | None = None,
     ) -> None:
         self.layer_name = layer.layer_name
         self.num_heads = layer.num_heads
@@ -115,6 +116,7 @@ class RopeReshapeKVCachePattern:
         self.head_size = layer.head_size
         self.head_size_v = layer.head_size_v
         self.is_neox = is_neox
+        self.rotary_dim = rotary_dim or self.head_size
 
         self.q_size = self.num_heads * self.head_size
         self.k_size = self.num_kv_heads * self.head_size
@@ -125,6 +127,7 @@ class RopeReshapeKVCachePattern:
             head_size=self.head_size,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
+            rotary_dim=self.rotary_dim,
         )
 
     def get_inputs(self) -> list:
@@ -133,7 +136,7 @@ class RopeReshapeKVCachePattern:
         L = 4096
         qkv = empty_bf16(T, self.q_size + self.k_size + self.v_size)
         positions = empty_i64(T)
-        cos_sin_cache = empty_bf16(L, self.head_size)
+        cos_sin_cache = empty_bf16(L, self.rotary_dim)
         inputs: list = [qkv, positions, cos_sin_cache]
         if _USE_LAYERNAME:
             inputs.append(_encode_layer_name(self.layer_name))
@@ -223,6 +226,163 @@ class RopeReshapeKVCachePattern:
         )
 
 
+class RopeKVCachePostNormPattern:
+    """
+    Matches MiniMax-style paths where Q/K were already normalized before RoPE:
+      q, k = rotary_embedding(positions, q, k, head_size, cos_sin_cache, is_neox)
+      q = q.view(-1, num_heads, head_size)
+      k = k.view(-1, num_kv_heads, head_size)
+      v = v.view(-1, num_kv_heads, head_size_v)
+      kv_cache_dummy = unified_kv_cache_update(k, v, layer_name)
+
+    and replaces RoPE + cache write with the fused side-effect op.
+    """
+
+    FUSED_OP = torch.ops.vllm.fused_rope_and_unified_kv_cache_update.default
+
+    def __init__(
+        self,
+        layer: Attention,
+        is_neox: bool,
+        rotary_dim: int | None = None,
+    ) -> None:
+        self.layer_name = layer.layer_name
+        self.num_heads = layer.num_heads
+        self.num_kv_heads = layer.num_kv_heads
+        self.head_size = layer.head_size
+        self.head_size_v = layer.head_size_v
+        self.is_neox = is_neox
+        self.rotary_dim = rotary_dim or self.head_size
+
+        self.q_size = self.num_heads * self.head_size
+        self.k_size = self.num_kv_heads * self.head_size
+        self.v_size = self.num_kv_heads * self.head_size_v
+
+        self.rope_matcher = MatcherRotaryEmbedding(
+            is_neox=self.is_neox,
+            head_size=self.head_size,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            rotary_dim=self.rotary_dim,
+        )
+
+    def get_inputs(self) -> list:
+        T = 5
+        L = 4096
+        q = empty_bf16(T, self.q_size)
+        k = empty_bf16(T, self.k_size)
+        v = empty_bf16(T, self.v_size)
+        positions = empty_i64(T)
+        cos_sin_cache = empty_bf16(L, self.rotary_dim)
+        inputs: list = [q, k, v, positions, cos_sin_cache]
+        if _USE_LAYERNAME:
+            inputs.append(_encode_layer_name(self.layer_name))
+        return inputs
+
+    def _mk_pattern_with_layer_name_input(self, _ln):
+        def pattern(q, k, v, positions, cos_sin_cache, layer_name):
+            q, k = self.rope_matcher(positions, q, k, cos_sin_cache)
+            q = q.view(-1, self.num_heads, self.head_size)
+            k = k.view(-1, self.num_kv_heads, self.head_size)
+            v = v.view(-1, self.num_kv_heads, self.head_size_v)
+            return torch.ops.vllm.unified_kv_cache_update(k, v, layer_name), q, k, v
+
+        def replacement(q, k, v, positions, cos_sin_cache, layer_name):
+            q = q.view(-1, self.num_heads, self.head_size)
+            k = k.view(-1, self.num_kv_heads, self.head_size)
+            v = v.view(-1, self.num_kv_heads, self.head_size_v)
+            results = auto_functionalized(
+                self.FUSED_OP,
+                query=q,
+                key=k,
+                value=v,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=self.is_neox,
+                layer_name=layer_name,
+            )
+            return results[0], results[1], results[2], v
+
+        return pattern, replacement
+
+    def _mk_pattern_with_layer_name_closure(self, _ln):
+        def pattern(q, k, v, positions, cos_sin_cache):
+            q, k = self.rope_matcher(positions, q, k, cos_sin_cache)
+            q = q.view(-1, self.num_heads, self.head_size)
+            k = k.view(-1, self.num_kv_heads, self.head_size)
+            v = v.view(-1, self.num_kv_heads, self.head_size_v)
+            return torch.ops.vllm.unified_kv_cache_update(k, v, _ln), q, k, v
+
+        def replacement(q, k, v, positions, cos_sin_cache):
+            q = q.view(-1, self.num_heads, self.head_size)
+            k = k.view(-1, self.num_kv_heads, self.head_size)
+            v = v.view(-1, self.num_kv_heads, self.head_size_v)
+            results = auto_functionalized(
+                self.FUSED_OP,
+                query=q,
+                key=k,
+                value=v,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=self.is_neox,
+                layer_name=_ln,
+            )
+            return results[0], results[1], results[2], v
+
+        return pattern, replacement
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        _ln = _encode_layer_name(self.layer_name)
+
+        if _USE_LAYERNAME:
+            pattern, replacement = self._mk_pattern_with_layer_name_input(_ln)
+        else:
+            pattern, replacement = self._mk_pattern_with_layer_name_closure(_ln)
+
+        def fwd_and_view_to_reshape(*args, **kwargs) -> fx.GraphModule:
+            gm = pm.fwd_only(*args, **kwargs)
+            view_to_reshape(gm)
+            return gm
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            fwd_and_view_to_reshape,
+            pm_pass,
+        )
+
+
+def _get_candidate_rotary_dims(config: VllmConfig, head_size: int) -> list[int]:
+    dims: set[int] = set()
+    hf_config = getattr(config.model_config, "hf_config", None)
+    rotary_dim = getattr(hf_config, "rotary_dim", None)
+    if isinstance(rotary_dim, int) and 0 < rotary_dim <= head_size:
+        dims.add(rotary_dim)
+
+    rope_parameters = getattr(hf_config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict):
+        partial_factor = rope_parameters.get("partial_rotary_factor")
+        if isinstance(partial_factor, (float, int)):
+            partial_dim = int(head_size * partial_factor)
+            if 0 < partial_dim <= head_size:
+                dims.add(partial_dim)
+
+    if not dims:
+        dims.add(head_size)
+
+    return sorted(dims, reverse=True)
+
+
+def _uses_minimax_post_norm_rope_pattern(config: VllmConfig) -> bool:
+    hf_config = getattr(config.model_config, "hf_config", None)
+    model_type = str(getattr(hf_config, "model_type", "")).lower()
+    architectures = getattr(hf_config, "architectures", []) or []
+    return "minimax" in model_type or any(
+        "minimax" in str(arch).lower() for arch in architectures
+    )
+
+
 class RopeKVCacheFusionPass(VllmPatternMatcherPass):
     """
     This pass fuses the rotary embedding and KV cache update operations
@@ -250,13 +410,23 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
         attn_layers = get_layers_from_vllm_config(config, Attention)
         # When _USE_LAYERNAME is enabled, layer_name is a wildcard so all
         # layers produce the same pattern — register once then break.
+        register_post_norm_pattern = _uses_minimax_post_norm_rope_pattern(config)
         for _, layer in attn_layers.items():
             if layer.impl.fused_rope_kvcache_supported():
+                rotary_dims = _get_candidate_rotary_dims(config, layer.head_size)
                 for is_neox in [True, False]:
-                    RopeReshapeKVCachePattern(
-                        layer=layer,
-                        is_neox=is_neox,
-                    ).register(self.patterns)
+                    for rotary_dim in rotary_dims:
+                        RopeReshapeKVCachePattern(
+                            layer=layer,
+                            is_neox=is_neox,
+                            rotary_dim=rotary_dim,
+                        ).register(self.patterns)
+                        if register_post_norm_pattern:
+                            RopeKVCachePostNormPattern(
+                                layer=layer,
+                                is_neox=is_neox,
+                                rotary_dim=rotary_dim,
+                            ).register(self.patterns)
                 if _USE_LAYERNAME:
                     break
 
@@ -274,4 +444,10 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
         return compile_range.end <= self.max_token_num
 
     def uuid(self) -> str:
-        return VllmInductorPass.hash_source(self, RopeReshapeKVCachePattern)
+        return VllmInductorPass.hash_source(
+            self,
+            RopeReshapeKVCachePattern,
+            RopeKVCachePostNormPattern,
+            _get_candidate_rotary_dims,
+            _uses_minimax_post_norm_rope_pattern,
+        )

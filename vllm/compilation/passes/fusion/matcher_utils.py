@@ -89,6 +89,7 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         head_size: int,
         num_heads: int,
         num_kv_heads: int,
+        rotary_dim: int | None = None,
         use_flashinfer: bool = False,
         match_rocm_aiter: bool | None = None,
         enabled: bool | None = None,
@@ -105,7 +106,7 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         self.num_kv_heads = num_kv_heads
         self.q_size = self.num_heads * self.head_size
         self.kv_size = self.num_kv_heads * self.head_size
-        self.rotary_dim = head_size
+        self.rotary_dim = rotary_dim or head_size
         if use_flashinfer:
             self.rotary_op = FLASHINFER_ROTARY_OP
         elif match_rocm_aiter:

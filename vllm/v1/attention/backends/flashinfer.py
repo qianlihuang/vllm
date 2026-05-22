@@ -65,6 +65,7 @@ from vllm.v1.attention.backends.utils import (
     get_per_layer_parameters,
     infer_global_hyperparameters,
     split_decodes_and_prefills,
+    supports_cuda_hopper_rope_kvcache_fusion,
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
@@ -1850,6 +1851,45 @@ class FlashInferImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+
+    def fused_rope_kvcache_supported(self):
+        return supports_cuda_hopper_rope_kvcache_fusion(
+            self.attn_type,
+            self.kv_sharing_target_layer_name,
+            self.kv_cache_dtype,
+        )
+
+    def do_rope_and_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+    ):
+        if self.kv_sharing_target_layer_name is not None:
+            return
+
+        k_cache = kv_cache[:, 0]
+        v_cache = kv_cache[:, 1]
+        torch.ops._C_cache_ops.fused_rope_and_cache_flash(
+            query,
+            key,
+            value,
+            k_cache,
+            v_cache,
+            layer_slot_mapping,
+            positions,
+            cos_sin_cache,
+            is_neox,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+        )
 
 
 def fast_plan_decode(

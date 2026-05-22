@@ -428,6 +428,126 @@ def test_reshape_and_cache_flash(
         torch.testing.assert_close(value_cache_compact, cloned_value_cache)
 
 
+@pytest.mark.parametrize(
+    ("num_q_heads", "num_kv_heads"),
+    [
+        (12, 2),  # MiniMax-M2 TP4
+        (6, 1),  # MiniMax-M2 TP8
+    ],
+)
+@pytest.mark.parametrize("block_size", [16, 32])
+@pytest.mark.parametrize("kv_cache_layout", CACHE_LAYOUTS)
+@pytest.mark.parametrize("is_neox", [True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("cos_sin_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_fused_rope_and_cache_flash_minimax_shape(
+    kv_cache_factory_flashinfer,
+    num_q_heads: int,
+    num_kv_heads: int,
+    block_size: int,
+    kv_cache_layout: str,
+    is_neox: bool,
+    dtype: torch.dtype,
+    cos_sin_dtype: torch.dtype,
+    device: str,
+) -> None:
+    if not current_platform.is_cuda():
+        pytest.skip("fused_rope_and_cache_flash is a CUDA-only kernel")
+
+    torch.set_default_device(device)
+    torch.accelerator.set_device_index(device)
+    set_random_seed(0)
+
+    num_tokens = 7
+    num_actual_tokens = 5
+    num_blocks = 4
+    head_size = 128
+    rotary_dim = 64
+    max_position = 32
+
+    query = torch.randn(num_tokens, num_q_heads, head_size, dtype=dtype, device=device)
+    key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=dtype, device=device)
+    value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.long, device=device)
+    cos_sin_cache = torch.randn(
+        max_position, rotary_dim, dtype=cos_sin_dtype, device=device
+    )
+
+    num_slots = block_size * num_blocks
+    slot_mapping = torch.tensor(
+        random.sample(range(num_slots), num_actual_tokens),
+        dtype=torch.long,
+        device=device,
+    )
+    slot_mapping[1] = -1
+
+    key_caches, value_caches = kv_cache_factory_flashinfer(
+        num_blocks,
+        block_size,
+        1,
+        num_kv_heads,
+        head_size,
+        "auto",
+        dtype,
+        device=device,
+        cache_layout=kv_cache_layout,
+    )
+    key_cache_ref, value_cache_ref = key_caches[0], value_caches[0]
+
+    def clone_preserve_strides(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_strided(
+            tuple(x.shape), tuple(x.stride()), dtype=x.dtype, device=x.device
+        )
+        out.copy_(x)
+        return out
+
+    key_cache_fused = clone_preserve_strides(key_cache_ref)
+    value_cache_fused = clone_preserve_strides(value_cache_ref)
+
+    query_ref = query.clone()
+    key_ref = key.clone()
+    query_fused = query.clone()
+    key_fused = key.clone()
+    k_scale = torch.ones(1, dtype=torch.float32, device=device)
+    v_scale = torch.ones(1, dtype=torch.float32, device=device)
+
+    ops.rotary_embedding(
+        positions, query_ref, key_ref, head_size, cos_sin_cache, is_neox
+    )
+    ops.reshape_and_cache_flash(
+        key_ref,
+        value,
+        key_cache_ref,
+        value_cache_ref,
+        slot_mapping,
+        "auto",
+        k_scale,
+        v_scale,
+    )
+
+    ops.fused_rope_and_cache_flash(
+        query_fused,
+        key_fused,
+        value,
+        key_cache_fused,
+        value_cache_fused,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        is_neox,
+        "auto",
+        k_scale,
+        v_scale,
+    )
+
+    torch.testing.assert_close(query_fused, query_ref)
+    torch.testing.assert_close(key_fused, key_ref)
+    torch.testing.assert_close(key_cache_fused, key_cache_ref)
+    torch.testing.assert_close(value_cache_fused, value_cache_ref)
+
+
 @pytest.mark.parametrize("direction", COPYING_DIRECTION)
 @pytest.mark.parametrize("num_mappings", NUM_MAPPINGS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)

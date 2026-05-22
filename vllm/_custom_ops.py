@@ -2640,6 +2640,36 @@ def reshape_and_cache_flash(
     )
 
 
+def fused_rope_and_cache_flash(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    torch.ops._C_cache_ops.fused_rope_and_cache_flash(
+        query,
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        is_neox,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+
+
 def concat_and_cache_mla(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,

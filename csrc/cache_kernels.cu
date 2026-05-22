@@ -388,6 +388,118 @@ __global__ void reshape_and_cache_flash_kernel(
   }
 }
 
+template <typename scalar_t, typename cos_sin_t, bool IS_NEOX>
+inline __device__ void fused_rope_cache_apply_pair(
+    scalar_t* __restrict__ arr, const cos_sin_t* __restrict__ cache_ptr,
+    const int rot_offset, const int embed_dim) {
+  int x_index;
+  int y_index;
+  int cache_index;
+  if constexpr (IS_NEOX) {
+    x_index = rot_offset;
+    y_index = embed_dim + rot_offset;
+    cache_index = rot_offset;
+  } else {
+    x_index = 2 * rot_offset;
+    y_index = 2 * rot_offset + 1;
+    cache_index = rot_offset;
+  }
+
+  const cos_sin_t* cos_ptr = cache_ptr;
+  const cos_sin_t* sin_ptr = cache_ptr + embed_dim;
+  const float cos_f = static_cast<float>(VLLM_LDG(cos_ptr + cache_index));
+  const float sin_f = static_cast<float>(VLLM_LDG(sin_ptr + cache_index));
+  const float x_f = static_cast<float>(arr[x_index]);
+  const float y_f = static_cast<float>(arr[y_index]);
+  arr[x_index] = static_cast<scalar_t>(x_f * cos_f - y_f * sin_f);
+  arr[y_index] = static_cast<scalar_t>(y_f * cos_f + x_f * sin_f);
+}
+
+template <typename scalar_t, typename cache_t, typename cos_sin_t, bool IS_NEOX,
+          Fp8KVCacheDataType kv_dt>
+__global__ void fused_rope_and_cache_flash_kernel(
+    scalar_t* __restrict__ query, scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value, cache_t* __restrict__ key_cache,
+    cache_t* __restrict__ value_cache,
+    const int64_t* __restrict__ slot_mapping,
+    const int64_t* __restrict__ positions,
+    const cos_sin_t* __restrict__ cos_sin_cache, const int rot_dim,
+    const int64_t query_stride, const int64_t key_stride,
+    const int64_t value_stride, const int64_t query_head_stride,
+    const int64_t key_head_stride, const int64_t value_head_stride,
+    const int64_t block_stride, const int64_t page_stride,
+    const int64_t cache_head_stride, const int num_q_heads,
+    const int num_kv_heads, const int head_size, const int block_size,
+    const int num_cache_tokens, const float* k_scale, const float* v_scale,
+    const int kv_scale_stride) {
+  const int64_t token_idx = blockIdx.x;
+  const int64_t pos = positions[token_idx];
+  const cos_sin_t* cache_ptr = cos_sin_cache + pos * rot_dim;
+  const int embed_dim = rot_dim / 2;
+
+  for (int i = threadIdx.x; i < num_q_heads * embed_dim; i += blockDim.x) {
+    const int head_idx = i / embed_dim;
+    const int rot_offset = i % embed_dim;
+    scalar_t* q_head_ptr =
+        query + token_idx * query_stride + head_idx * query_head_stride;
+    fused_rope_cache_apply_pair<scalar_t, cos_sin_t, IS_NEOX>(
+        q_head_ptr, cache_ptr, rot_offset, embed_dim);
+  }
+
+  for (int i = threadIdx.x; i < num_kv_heads * embed_dim; i += blockDim.x) {
+    const int head_idx = i / embed_dim;
+    const int rot_offset = i % embed_dim;
+    scalar_t* k_head_ptr =
+        key + token_idx * key_stride + head_idx * key_head_stride;
+    fused_rope_cache_apply_pair<scalar_t, cos_sin_t, IS_NEOX>(
+        k_head_ptr, cache_ptr, rot_offset, embed_dim);
+  }
+
+  // K must be fully rotated before the same CTA writes it into the paged cache.
+  __syncthreads();
+
+  if (token_idx >= num_cache_tokens) {
+    return;
+  }
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  // NOTE: slot_idx can be -1 if the token is padded.
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  cache_t* __restrict__ key_dst =
+      key_cache + block_idx * block_stride + block_offset * page_stride;
+  cache_t* __restrict__ value_dst =
+      value_cache + block_idx * block_stride + block_offset * page_stride;
+
+  const scalar_t* __restrict__ key_src = key + token_idx * key_stride;
+  const scalar_t* __restrict__ value_src = value + token_idx * value_stride;
+
+  for (int i = threadIdx.x; i < num_kv_heads * head_size; i += blockDim.x) {
+    const int head_idx = i / head_size;
+    const int head_offset = i % head_size;
+    const float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
+                                  ? 0.f
+                                  : k_scale[head_idx * kv_scale_stride];
+    const float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
+                                  ? 0.f
+                                  : v_scale[head_idx * kv_scale_stride];
+    CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+    CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+    const int64_t src_key_offset =
+        static_cast<int64_t>(head_idx) * key_head_stride + head_offset;
+    const int64_t src_value_offset =
+        static_cast<int64_t>(head_idx) * value_head_stride + head_offset;
+    const int64_t dst_offset =
+        static_cast<int64_t>(head_idx) * cache_head_stride + head_offset;
+    k_op(key_dst[dst_offset], key_src[src_key_offset]);
+    v_op(value_dst[dst_offset], value_src[src_value_offset]);
+  }
+}
+
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_kernel(
     const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
@@ -797,6 +909,156 @@ void reshape_and_cache_flash(
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);
+}
+
+void fused_rope_and_cache_flash(
+    torch::Tensor& query,      // [num_tokens, num_heads, head_size]
+    torch::Tensor& key,        // [num_tokens, num_kv_heads, head_size]
+    torch::Tensor& value,      // [num_tokens, num_kv_heads, head_size]
+    torch::Tensor& key_cache,  // [num_blocks, block_size, num_kv_heads, head_size]
+    torch::Tensor&
+        value_cache,  // [num_blocks, block_size, num_kv_heads, head_size]
+    torch::Tensor& slot_mapping,  // [num_actual_tokens]
+    torch::Tensor& positions,     // [num_tokens]
+    torch::Tensor& cos_sin_cache, // [max_position, rot_dim]
+    bool is_neox, const std::string& kv_cache_dtype,
+    torch::Tensor& k_scale,    // [1]
+    torch::Tensor& v_scale) {  // [1]
+  TORCH_CHECK(kv_cache_dtype == "auto",
+              "fused_rope_and_cache_flash currently supports only "
+              "kv_cache_dtype='auto'.");
+
+  TORCH_CHECK(query.is_cuda(), "query must be a CUDA tensor");
+  TORCH_CHECK(key.is_cuda(), "key must be a CUDA tensor");
+  TORCH_CHECK(value.is_cuda(), "value must be a CUDA tensor");
+  TORCH_CHECK(key_cache.is_cuda(), "key_cache must be a CUDA tensor");
+  TORCH_CHECK(value_cache.is_cuda(), "value_cache must be a CUDA tensor");
+  TORCH_CHECK(slot_mapping.is_cuda(), "slot_mapping must be a CUDA tensor");
+  TORCH_CHECK(positions.is_cuda(), "positions must be a CUDA tensor");
+  TORCH_CHECK(cos_sin_cache.is_cuda(), "cos_sin_cache must be a CUDA tensor");
+
+  TORCH_CHECK(query.dim() == 3, "query must have shape [T, Hq, D]");
+  TORCH_CHECK(key.dim() == 3, "key must have shape [T, Hkv, D]");
+  TORCH_CHECK(value.dim() == 3, "value must have shape [T, Hkv, D]");
+  TORCH_CHECK(key_cache.dim() == 4,
+              "key_cache must have shape [num_blocks, block_size, Hkv, D]");
+  TORCH_CHECK(value_cache.dim() == 4,
+              "value_cache must have shape [num_blocks, block_size, Hkv, D]");
+  TORCH_CHECK(positions.dim() == 1, "positions must be 1D");
+  TORCH_CHECK(slot_mapping.dim() == 1, "slot_mapping must be 1D");
+  TORCH_CHECK(cos_sin_cache.dim() == 2, "cos_sin_cache must be 2D");
+  TORCH_CHECK(positions.scalar_type() == c10::ScalarType::Long,
+              "positions must be int64");
+  TORCH_CHECK(slot_mapping.scalar_type() == c10::ScalarType::Long,
+              "slot_mapping must be int64");
+
+  TORCH_CHECK(query.scalar_type() == key.scalar_type(),
+              "query and key must have the same dtype");
+  TORCH_CHECK(query.scalar_type() == value.scalar_type(),
+              "query and value must have the same dtype");
+  TORCH_CHECK(query.scalar_type() == key_cache.scalar_type(),
+              "key_cache must have the same dtype as query for auto KV cache");
+  TORCH_CHECK(query.scalar_type() == value_cache.scalar_type(),
+              "value_cache must have the same dtype as query for auto KV cache");
+  TORCH_CHECK(query.stride(2) == 1 && key.stride(2) == 1 &&
+                  value.stride(2) == 1,
+              "query, key, and value must be contiguous in the head dimension");
+
+  const int64_t num_tokens = query.size(0);
+  if (num_tokens == 0) {
+    return;
+  }
+  TORCH_CHECK(key.size(0) == num_tokens, "key token count must match query");
+  TORCH_CHECK(value.size(0) == num_tokens, "value token count must match query");
+  TORCH_CHECK(positions.size(0) == num_tokens,
+              "positions token count must match query");
+  TORCH_CHECK(slot_mapping.size(0) <= num_tokens,
+              "slot_mapping cannot be longer than query");
+
+  const int num_q_heads = query.size(1);
+  const int num_kv_heads = key.size(1);
+  const int head_size = query.size(2);
+  const int rot_dim = cos_sin_cache.size(1);
+  TORCH_CHECK(rot_dim % 2 == 0, "rotary dimension must be even");
+  TORCH_CHECK(rot_dim <= head_size,
+              "rotary dimension must be less than or equal to head_size");
+  TORCH_CHECK(key.size(2) == head_size, "key head_size must match query");
+  TORCH_CHECK(value.size(1) == num_kv_heads,
+              "value num_kv_heads must match key");
+  TORCH_CHECK(value.size(2) == head_size, "value head_size must match key");
+  TORCH_CHECK(key_cache.size(2) == num_kv_heads,
+              "key_cache num_heads must match key");
+  TORCH_CHECK(value_cache.size(2) == num_kv_heads,
+              "value_cache num_heads must match key");
+  TORCH_CHECK(key_cache.size(3) == head_size,
+              "key_cache head_size must match key");
+  TORCH_CHECK(value_cache.size(3) == head_size,
+              "value_cache head_size must match value");
+  TORCH_CHECK(key_cache.size(0) == value_cache.size(0) &&
+                  key_cache.size(1) == value_cache.size(1),
+              "key_cache and value_cache must have matching block shapes");
+  TORCH_CHECK(k_scale.sizes() == v_scale.sizes(),
+              "k_scale and v_scale must have the same shape");
+  TORCH_CHECK(k_scale.numel() == 1 || k_scale.numel() == num_kv_heads,
+              "k_scale and v_scale must be of shape [1] or [num_kv_heads]");
+
+  const int block_size = key_cache.size(1);
+  const int num_cache_tokens = slot_mapping.size(0);
+  const int kv_scale_stride = (k_scale.numel() > 1) ? 1 : 0;
+
+  const int rope_work =
+      std::max(num_q_heads, num_kv_heads) * std::max(rot_dim / 2, 1);
+  const int cache_work = num_kv_heads * head_size;
+  dim3 grid(num_tokens);
+  dim3 block(std::min(std::max(rope_work, cache_work), 512));
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  VLLM_DISPATCH_FLOATING_TYPES(query.scalar_type(), "fused_rope_cache_qkv", [&] {
+    using qk_t = scalar_t;
+    VLLM_DISPATCH_FLOATING_TYPES(
+        cos_sin_cache.scalar_type(), "fused_rope_cache_cos_sin", [&] {
+          using cos_sin_t = scalar_t;
+          if (is_neox) {
+            vllm::fused_rope_and_cache_flash_kernel<
+                qk_t, qk_t, cos_sin_t, true, Fp8KVCacheDataType::kAuto>
+                <<<grid, block, 0, stream>>>(
+                    query.data_ptr<qk_t>(), key.data_ptr<qk_t>(),
+                    value.data_ptr<qk_t>(), key_cache.data_ptr<qk_t>(),
+                    value_cache.data_ptr<qk_t>(),
+                    slot_mapping.data_ptr<int64_t>(),
+                    positions.data_ptr<int64_t>(),
+                    cos_sin_cache.data_ptr<cos_sin_t>(), rot_dim,
+                    query.stride(0), key.stride(0), value.stride(0),
+                    query.stride(1), key.stride(1), value.stride(1),
+                    key_cache.stride(0), key_cache.stride(1),
+                    key_cache.stride(2), num_q_heads, num_kv_heads, head_size,
+                    block_size, num_cache_tokens,
+                    reinterpret_cast<const float*>(k_scale.data_ptr()),
+                    reinterpret_cast<const float*>(v_scale.data_ptr()),
+                    kv_scale_stride);
+          } else {
+            vllm::fused_rope_and_cache_flash_kernel<
+                qk_t, qk_t, cos_sin_t, false, Fp8KVCacheDataType::kAuto>
+                <<<grid, block, 0, stream>>>(
+                    query.data_ptr<qk_t>(), key.data_ptr<qk_t>(),
+                    value.data_ptr<qk_t>(), key_cache.data_ptr<qk_t>(),
+                    value_cache.data_ptr<qk_t>(),
+                    slot_mapping.data_ptr<int64_t>(),
+                    positions.data_ptr<int64_t>(),
+                    cos_sin_cache.data_ptr<cos_sin_t>(), rot_dim,
+                    query.stride(0), key.stride(0), value.stride(0),
+                    query.stride(1), key.stride(1), value.stride(1),
+                    key_cache.stride(0), key_cache.stride(1),
+                    key_cache.stride(2), num_q_heads, num_kv_heads, head_size,
+                    block_size, num_cache_tokens,
+                    reinterpret_cast<const float*>(k_scale.data_ptr()),
+                    reinterpret_cast<const float*>(v_scale.data_ptr()),
+                    kv_scale_stride);
+          }
+        });
+  });
 }
 
 // KV_T is the data type of key and value tensors.

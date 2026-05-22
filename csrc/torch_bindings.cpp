@@ -375,6 +375,23 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("reshape_and_cache_flash", torch::kCUDA,
                  &reshape_and_cache_flash);
 
+  // Apply RoPE to Q/K, then reshape K/V and cache them.
+  cache_ops.def(
+      "fused_rope_and_cache_flash(Tensor! query,"
+      "                           Tensor! key,"
+      "                           Tensor value,"
+      "                           Tensor! key_cache,"
+      "                           Tensor! value_cache,"
+      "                           Tensor slot_mapping,"
+      "                           Tensor positions,"
+      "                           Tensor cos_sin_cache,"
+      "                           bool is_neox,"
+      "                           str kv_cache_dtype,"
+      "                           Tensor k_scale,"
+      "                           Tensor v_scale) -> ()");
+  cache_ops.impl("fused_rope_and_cache_flash", torch::kCUDA,
+                 &fused_rope_and_cache_flash);
+
   // Concat kv_c and k_pe and cache them.
   cache_ops.def(
       "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"
