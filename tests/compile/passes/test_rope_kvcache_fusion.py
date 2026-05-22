@@ -62,6 +62,7 @@ class QKRoPEKVCacheTestModel(torch.nn.Module):
         self.block_size = vllm_config.cache_config.block_size
         self.q_size = num_heads * head_size
         self.kv_size = num_kv_heads * head_size
+        self.head_size_v = head_size
         self.is_neox = is_neox
         self.dtype = dtype
         self.device = device
