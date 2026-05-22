@@ -33,7 +33,10 @@ MINIMAX_SHAPES = {
 def set_device(device: str) -> None:
     torch.set_default_device(device)
     if device.startswith("cuda"):
-        torch.cuda.set_device(torch.device(device))
+        dev = torch.device(device)
+        if dev.index is None:
+            dev = torch.device("cuda:0")
+        torch.cuda.set_device(dev)
 
 
 def make_cos_sin_cache(
