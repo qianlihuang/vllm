@@ -29,6 +29,10 @@ Usage:
         - fill_mean (float): Mean value for random normal fill (default: 0.015)
         - fill_std (float): Standard deviation for random fill (default: 0.0)
           Set to 0 for constant values, >0 for random sampling
+        - skip_fill (bool): Skip writing KV cache contents after allocation
+          (default: false). This is useful for benchmarking decode scheduling and
+          attention with already-allocated cache blocks without including the
+          synthetic KV population cost.
 """
 
 from dataclasses import dataclass
@@ -97,7 +101,19 @@ class DecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = DecodeBenchConnectorScheduler(vllm_config)
         elif role == KVConnectorRole.WORKER:
-            self.connector_worker = DecodeBenchConnectorWorker(vllm_config)
+            self.connector_worker = DecodeBenchConnectorWorker(
+                vllm_config, kv_cache_config
+            )
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
+        if vllm_config.model_config is not None and vllm_config.model_config.use_mla:
+            return None
+        logger.info_once(
+            "DecodeBenchConnector setting KV cache layout to HND to match "
+            "NixlConnector decode deployments."
+        )
+        return "HND"
 
     # ==============================
     # Worker-side methods
@@ -300,8 +316,9 @@ class DecodeBenchConnectorScheduler:
 class DecodeBenchConnectorWorker:
     """Worker-side implementation for DecodeBenchConnector."""
 
-    def __init__(self, vllm_config: "VllmConfig"):
+    def __init__(self, vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"):
         self.vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config
         self.block_size = vllm_config.cache_config.block_size
 
         # Get fill parameters from extra config
@@ -309,6 +326,7 @@ class DecodeBenchConnectorWorker:
         assert kv_transfer_config is not None
         self.fill_mean = kv_transfer_config.get_from_extra_config("fill_mean", 0.015)
         self.fill_std = kv_transfer_config.get_from_extra_config("fill_std", 0.0)
+        self.skip_fill = kv_transfer_config.get_from_extra_config("skip_fill", False)
 
         # Will be populated via register_kv_caches
         self.kv_caches: dict[str, torch.Tensor] | None = None
@@ -320,10 +338,20 @@ class DecodeBenchConnectorWorker:
         """Store references to the KV cache tensors and build group mapping."""
         self.kv_caches = kv_caches
 
-        # For simplicity, assume all layers belong to group 0 (standard attention)
-        # For MLA models with multiple groups, the metadata will handle the mapping
-        # We just need to fill the blocks specified in the metadata
-        self.group_to_layers = {0: list(kv_caches.keys())}
+        known_layers = set(kv_caches)
+        group_to_layers: dict[int, list[str]] = {}
+        for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            group_layers = [
+                layer_name
+                for layer_name in group.layer_names
+                if layer_name in known_layers
+            ]
+            if group_layers:
+                group_to_layers[group_idx] = group_layers
+
+        # Unit tests and some synthetic runners use simplified layer names that
+        # do not come from KVCacheConfig. Preserve the legacy single-group path.
+        self.group_to_layers = group_to_layers or {0: list(kv_caches.keys())}
 
         logger.debug(
             "DecodeBenchConnector: Registered %d KV cache layers",
@@ -339,7 +367,7 @@ class DecodeBenchConnectorWorker:
 
         Supports both standard attention (single group) and MLA (multiple groups).
         """
-        if not metadata.reqs_to_fill:
+        if not metadata.reqs_to_fill or self.skip_fill:
             return
 
         assert self.kv_caches is not None, "KV caches must be registered before filling"
@@ -411,15 +439,12 @@ class DecodeBenchConnectorWorker:
                     device=kv_cache.device,
                 )
             else:
-                # Constant fill value
-                fill_values = torch.full(
-                    (len(valid_block_ids),) + block_shape,
-                    self.fill_mean,
-                    dtype=kv_cache.dtype,
-                    device=kv_cache.device,
-                )
+                # Constant fill value. index_fill_ avoids materializing a large
+                # temporary tensor for every layer and request.
+                kv_cache.index_fill_(0, valid_block_ids, self.fill_mean)
+                continue
 
-            # Batch fill operation
+            # Batch random fill operation
             kv_cache[valid_block_ids] = fill_values
 
         logger.debug(

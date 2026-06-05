@@ -35,7 +35,12 @@ from .utils import (
 class DecodeBenchTestRunner:
     """Test runner for DecodeBenchConnector."""
 
-    def __init__(self, block_size: int, num_gpu_blocks: int):
+    def __init__(
+        self,
+        block_size: int,
+        num_gpu_blocks: int,
+        kv_connector_extra_config: dict[str, object] | None = None,
+    ):
         self.block_size = block_size
         self.num_gpu_blocks = num_gpu_blocks
 
@@ -46,6 +51,7 @@ class DecodeBenchTestRunner:
             block_size=block_size,
             max_num_batched_tokens=1000,
             kv_connector="DecodeBenchConnector",
+            kv_connector_extra_config=kv_connector_extra_config,
         )
 
         self.vllm_config = vllm_config
@@ -177,6 +183,27 @@ def test_decode_bench_connector_basic():
             block_data = kv_cache[block_id]
             # Should be filled with constant value 0.015
             assert torch.allclose(block_data, torch.tensor(0.015))
+
+
+def test_decode_bench_connector_skip_fill():
+    """Test DecodeBenchConnector can skip synthetic KV writes."""
+    block_size = 16
+    num_gpu_blocks = 100
+
+    runner = DecodeBenchTestRunner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        kv_connector_extra_config={"skip_fill": True},
+    )
+
+    req = runner.new_request([1] * (block_size * 2))
+    _, metadata = runner.run_single_step()
+
+    assert req.request_id in metadata.reqs_to_fill
+    block_ids_per_group, _ = metadata.reqs_to_fill[req.request_id]
+    for block_id in block_ids_per_group[0]:
+        for kv_cache in runner.kv_caches.values():
+            assert torch.count_nonzero(kv_cache[block_id]) == 0
 
 
 def test_decode_bench_connector_no_refill():

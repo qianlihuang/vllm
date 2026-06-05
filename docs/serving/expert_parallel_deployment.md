@@ -315,6 +315,8 @@ except Exception as e:
 
 ### Benchmarking
 
-- To simulate the decode deployment of disaggregated serving, pass `--kv-transfer-config '{"kv_connector":"DecodeBenchConnector","kv_role":"kv_both"}'` to the `vllm serve` invocation. The connector populates KV cache with random values so decode can be profiled in isolation.
+- To simulate the decode deployment of disaggregated serving, pass `--kv-transfer-config '{"kv_connector":"DecodeBenchConnector","kv_role":"kv_both"}'` to the `vllm serve` invocation.
+  The connector allocates prompt KV blocks and populates them with synthetic values so decode can be profiled in isolation.
+  To exclude the synthetic KV write cost from the benchmark, set `kv_connector_extra_config.skip_fill=true`.
 
 - **CUDAGraph capture**: Use `--compilation_config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'` to enable CUDA graph capture for decode only and save KV cache.
