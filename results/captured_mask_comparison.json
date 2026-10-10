@@ -1,0 +1,24 @@
+{
+  "captured_rows": 512,
+  "vocab": 248320,
+  "chunk_rows": 64,
+  "top_k": 20,
+  "top_p": 0.95,
+  "comparisons": {
+    "cake_vs_triton": {
+      "mask_diff_rows": 0,
+      "tv_max": 0.0,
+      "tv_mean": 0.0
+    },
+    "cake_vs_pytorch": {
+      "mask_diff_rows": 23,
+      "tv_max": 0.030581324639213866,
+      "tv_mean": 0.0007064469658351758
+    },
+    "triton_vs_pytorch": {
+      "mask_diff_rows": 23,
+      "tv_max": 0.030581324639213866,
+      "tv_mean": 0.0007064469658351758
+    }
+  }
+}
