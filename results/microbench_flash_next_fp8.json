@@ -1,0 +1,424 @@
+{
+ "metadata": {
+  "source": "flash_next_fp8_logits.pt",
+  "gpu": "NVIDIA H200",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "flashinfer": "0.7.1",
+  "dtype": "torch.float32",
+  "vocab_size": 248320,
+  "top_k": 20,
+  "top_p": 0.95,
+  "rounds": 3,
+  "repeats": 50,
+  "mask_timing": "CUDA graph events; restore and 128 MiB L2 flush excluded",
+  "sample_timing": "FlashInfer CUPTI helper; CUDA graph; cold L2"
+ },
+ "cases": [
+  {
+   "rows": 1,
+   "mask_dispatch": "cake",
+   "correctness": {
+    "triton": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake_exact_k_tv_max": 0.0
+   },
+   "timings_us": {
+    "mask_triton": [
+     237.59999871253967,
+     237.7759963274002,
+     238.3039966225624
+    ],
+    "mask_cake": [
+     58.62399935722351,
+     58.768000453710556,
+     58.75200033187866
+    ],
+    "sample_flashinfer": [
+     184.0165,
+     183.888,
+     183.3755
+    ],
+    "sample_cake": [
+     74.17599999999999,
+     73.85600000000001,
+     74.3515
+    ]
+   },
+   "median_us": {
+    "mask_triton": 237.7759963274002,
+    "mask_cake": 58.75200033187866,
+    "sample_flashinfer": 183.888,
+    "sample_cake": 74.17599999999999
+   }
+  },
+  {
+   "rows": 2,
+   "mask_dispatch": "cake",
+   "correctness": {
+    "triton": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake_exact_k_tv_max": 0.0
+   },
+   "timings_us": {
+    "mask_triton": [
+     245.88800221681595,
+     246.44800275564194,
+     246.0480034351349
+    ],
+    "mask_cake": [
+     57.96799995005131,
+     58.20799991488457,
+     58.19199979305267
+    ],
+    "sample_flashinfer": [
+     185.9035,
+     185.26399999999998,
+     185.74400000000003
+    ],
+    "sample_cake": [
+     74.36800000000001,
+     74.416,
+     74.032
+    ]
+   },
+   "median_us": {
+    "mask_triton": 246.0480034351349,
+    "mask_cake": 58.19199979305267,
+    "sample_flashinfer": 185.74400000000003,
+    "sample_cake": 74.36800000000001
+   }
+  },
+  {
+   "rows": 4,
+   "mask_dispatch": "cake",
+   "correctness": {
+    "triton": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake_exact_k_tv_max": 1.9367778561485416e-09
+   },
+   "timings_us": {
+    "mask_triton": [
+     245.79200148582458,
+     245.36000192165375,
+     245.71199715137482
+    ],
+    "mask_cake": [
+     59.07199904322624,
+     59.007998555898666,
+     58.88000130653381
+    ],
+    "sample_flashinfer": [
+     187.5845,
+     187.712,
+     188.256
+    ],
+    "sample_cake": [
+     74.81599999999999,
+     75.6,
+     75.5365
+    ]
+   },
+   "median_us": {
+    "mask_triton": 245.71199715137482,
+    "mask_cake": 59.007998555898666,
+    "sample_flashinfer": 187.712,
+    "sample_cake": 75.5365
+   }
+  },
+  {
+   "rows": 8,
+   "mask_dispatch": "cake",
+   "correctness": {
+    "triton": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake_exact_k_tv_max": 2.8998855650108624e-08
+   },
+   "timings_us": {
+    "mask_triton": [
+     242.72000044584274,
+     242.5920069217682,
+     242.97600239515305
+    ],
+    "mask_cake": [
+     61.76000088453293,
+     62.063999474048615,
+     62.04799935221672
+    ],
+    "sample_flashinfer": [
+     190.7365,
+     191.28,
+     191.5365
+    ],
+    "sample_cake": [
+     76.48,
+     76.01650000000001,
+     77.056
+    ]
+   },
+   "median_us": {
+    "mask_triton": 242.72000044584274,
+    "mask_cake": 62.04799935221672,
+    "sample_flashinfer": 191.28,
+    "sample_cake": 76.48
+   }
+  },
+  {
+   "rows": 16,
+   "mask_dispatch": "cake",
+   "correctness": {
+    "triton": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake_exact_k_tv_max": 2.8998855650108624e-08
+   },
+   "timings_us": {
+    "mask_triton": [
+     245.15199661254883,
+     245.55200338363647,
+     245.53600698709488
+    ],
+    "mask_cake": [
+     73.93599674105644,
+     74.0639977157116,
+     73.71200248599052
+    ],
+    "sample_flashinfer": [
+     242.6085,
+     241.96800000000002,
+     242.5275
+    ],
+    "sample_cake": [
+     85.80799999999999,
+     85.24799999999999,
+     85.47200000000001
+    ]
+   },
+   "median_us": {
+    "mask_triton": 245.53600698709488,
+    "mask_cake": 73.93599674105644,
+    "sample_flashinfer": 242.5275,
+    "sample_cake": 85.47200000000001
+   }
+  },
+  {
+   "rows": 32,
+   "mask_dispatch": "cake",
+   "correctness": {
+    "triton": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake": {
+     "mask_diff_rows": 0,
+     "tv_mean": 0.0,
+     "tv_max": 0.0
+    },
+    "cake_exact_k_tv_max": 2.8998855650108624e-08
+   },
+   "timings_us": {
+    "mask_triton": [
+     251.55198574066162,
+     251.53599679470062,
+     251.40799582004547
+    ],
+    "mask_cake": [
+     123.07199835777283,
+     122.83199653029442,
+     123.00799787044525
+    ],
+    "sample_flashinfer": [
+     321.392,
+     318.97600000000006,
+     321.744
+    ],
+    "sample_cake": [
+     121.072,
+     122.52799999999999,
+     121.21600000000001
+    ]
+   },
+   "median_us": {
+    "mask_triton": 251.53599679470062,
+    "mask_cake": 123.00799787044525,
+    "sample_flashinfer": 321.392,
+    "sample_cake": 121.21600000000001
+   }
+  },
+  {
+   "rows": 64,
+   "mask_dispatch": "cake",
+   "correctness": {
+    "triton": {
+     "mask_diff_rows": 1,
+     "tv_mean": 0.00015629693316312958,
+     "tv_max": 0.010003003722440293
+    },
+    "cake": {
+     "mask_diff_rows": 1,
+     "tv_mean": 0.00015629693316312958,
+     "tv_max": 0.010003003722440293
+    },
+    "cake_exact_k_tv_max": 2.8998855650108624e-08
+   },
+   "timings_us": {
+    "mask_triton": [
+     335.7279896736145,
+     335.2319896221161,
+     335.80799400806427
+    ],
+    "mask_cake": [
+     174.78400468826294,
+     175.02400279045105,
+     173.87200146913528
+    ],
+    "sample_flashinfer": [
+     408.976,
+     407.92,
+     408.94399999999996
+    ],
+    "sample_cake": [
+     151.93649999999997,
+     152.0485,
+     151.6805
+    ]
+   },
+   "median_us": {
+    "mask_triton": 335.7279896736145,
+    "mask_cake": 174.78400468826294,
+    "sample_flashinfer": 408.94399999999996,
+    "sample_cake": 151.93649999999997
+   }
+  },
+  {
+   "rows": 128,
+   "mask_dispatch": "triton",
+   "correctness": {
+    "triton": {
+     "mask_diff_rows": 2,
+     "tv_mean": 0.0002853679091394397,
+     "tv_max": 0.026524088647407986
+    },
+    "cake": {
+     "mask_diff_rows": 2,
+     "tv_mean": 0.0002853679091394397,
+     "tv_max": 0.026524088647407986
+    },
+    "cake_exact_k_tv_max": 2.8998855650108624e-08
+   },
+   "timings_us": {
+    "mask_triton": [
+     333.44000577926636,
+     333.5680067539215,
+     333.871990442276
+    ],
+    "mask_cake": [
+     296.4160144329071,
+     294.20799016952515,
+     295.51999270915985
+    ],
+    "sample_flashinfer": [
+     526.528,
+     526.9915000000001,
+     527.375
+    ],
+    "sample_cake": [
+     228.752,
+     228.544,
+     228.67100000000002
+    ]
+   },
+   "median_us": {
+    "mask_triton": 333.5680067539215,
+    "mask_cake": 295.51999270915985,
+    "sample_flashinfer": 526.9915000000001,
+    "sample_cake": 228.67100000000002
+   }
+  },
+  {
+   "rows": 256,
+   "mask_dispatch": "triton",
+   "correctness": {
+    "triton": {
+     "mask_diff_rows": 6,
+     "tv_mean": 0.000442548588131961,
+     "tv_max": 0.029605273184296173
+    },
+    "cake": {
+     "mask_diff_rows": 6,
+     "tv_mean": 0.000442548588131961,
+     "tv_max": 0.029605273184296173
+    },
+    "cake_exact_k_tv_max": 2.8998855650108624e-08
+   },
+   "timings_us": {
+    "mask_triton": [
+     602.4640202522278,
+     601.39200091362,
+     601.0079979896545
+    ],
+    "mask_cake": [
+     519.2480087280273,
+     519.5519924163818,
+     519.3920135498047
+    ],
+    "sample_flashinfer": [
+     850.2725,
+     849.6479999999999,
+     849.7595
+    ],
+    "sample_cake": [
+     357.39200000000005,
+     357.55199999999996,
+     356.94399999999996
+    ]
+   },
+   "median_us": {
+    "mask_triton": 601.39200091362,
+    "mask_cake": 519.3920135498047,
+    "sample_flashinfer": 849.7595,
+    "sample_cake": 357.39200000000005
+   }
+  }
+ ]
+}

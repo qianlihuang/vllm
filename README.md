@@ -98,7 +98,97 @@ its sign varies at every concurrency. The rounds at C32 also disagree in sign.
 From the kernel savings, the expected gain is about 1–3% of step time, which is
 below this run-to-run variation. Every run completed all requests with the
 expected output token count. The two arms' acceptance lengths are within 0.06
-of each other.
+of each other. The seeded, order-balanced rerun below resolves the small gain
+at concurrency 1.
+
+## Seeded, order-balanced A/B (2026-10-12)
+
+This rerun reduces the noise of the sweep above in two ways:
+
+- **Fixed seeds.** Every request carries a fixed sampling seed. MRV2 seeds
+  Gumbel sampling by position, so with identical masks both arms generate the
+  same tokens and acceptance stops varying by chance. At concurrency 1,
+  acceptance length matched exactly in every pair.
+- **Balanced order.** Four rounds alternate which arm runs first. Each run uses
+  max(16, 8 × concurrency) prompts.
+
+All configurations use the same branch and toggle only
+`VLLM_USE_FLASHINFER_CAKE_SAMPLER`:
+
+- BF16 `Qwen/Qwen3.8-Flash-Next`: 4×H200, TP4 + EP, `--max-num-seqs 128`.
+- FP8 `Qwen/Qwen3.8-Flash-Next-FP8`: 2×H200, TP2 without EP,
+  `--max-num-seqs 128`.
+- FP8: 8×H200, TP8 + EP, `--max-num-seqs 256`, at most 512 prompts per run.
+
+Cake − baseline output throughput, mean ± SE over four rounds
+([per-run CSVs and summary](results/seeded/), [plot](results/seeded/delta.png)):
+
+| Concurrency | BF16 TP4+EP | FP8 TP2 | FP8 TP8+EP |
+| --- | --- | --- | --- |
+| 1 | **+1.4% ± 0.2** | **+1.3% ± 0.3** | **+0.8% ± 0.3** |
+| 2 | −0.7% ± 1.1 | 0.0% ± 1.0 | |
+| 4 | +2.5% ± 1.5 | −2.3% ± 1.8 | +4.2% ± 2.4 |
+| 8 | +2.6% ± 3.1 | +1.5% ± 3.2 | |
+| 16 | 0.0% ± 2.0 | +0.4% ± 1.6 | +1.2% ± 4.7 |
+| 32 | +5.5% ± 2.7 | +1.4% ± 1.7 | |
+| 64 | | | +4.4% ± 3.3 |
+| 128 | | | +0.8% ± 5.5 |
+| 256 | | | +2.4% ± 8.9 |
+
+**At concurrency 1**, Cake is faster in all 12 rounds across the three
+configurations, with identical acceptance length.
+
+**Above concurrency 1**, the differences are within run-to-run noise. The
+reasons:
+
+- With MTP3 the target-side mask has 4 rows per request. Cake's mask path
+  (≤ 64 rows) therefore serves batches of at most 16 requests.
+- Above that, Cake runs only in partial steps. At C32, a call-count probe found
+  about 85 Cake calls in about 1,500 steps, which saves about 14 ms per run.
+- Draft sampling ignores top-k/top-p, so it never uses Cake.
+
+**Noise sources**:
+
+- An A/A repeat of the BF16 baseline at C32 varied by 4.6%
+  ([diagnostics](results/seeded/bf16_c32_diagnostics.json)).
+- With TP8 + EP at 64 or more requests, the single-process Python client ran at
+  100% CPU. Consecutive runs at the same concurrency differed by up to 21% in
+  either arm.
+- C256 with 512 prompts is not steady state.
+- TP8 + EP does not shorten the step at concurrency 1 (about 9.3 ms per step,
+  against 8.7–10 ms for the others). Its communication offsets the extra
+  compute, so sampling's share of the step does not grow.
+
+**FP8 environment.** The FP8 runs added the official wheel's generated
+`vllm/third_party` Python modules (FlashMLA interface, DeepGEMM,
+triton_kernels), which the FP8 load path imports. The BF16 runs did not need
+them.
+
+**FP8 logits microbenchmark.** Captured from FP8 TP2 serving, median µs over
+three rounds ([JSON](results/microbench_flash_next_fp8.json)). The
+results match the BF16 logits.
+
+| Sampling rows | Triton mask | Cake mask | FlashInfer sampling | Cake sampling |
+| --- | --- | --- | --- | --- |
+| 1 | 237.8 | 58.8 | 183.9 | 74.2 |
+| 8 | 242.7 | 62.0 | 191.3 | 76.5 |
+| 64 | 335.7 | 174.8 | 408.9 | 151.9 |
+| 128 | 333.6 | (295.5, not dispatched) | 527.0 | 228.7 |
+| 256 | 601.4 | (519.4, not dispatched) | 849.8 | 357.4 |
+
+To reproduce the seeded sweep:
+1. Start the server as in Reproduction below, with the configuration's
+   parallelism and `--max-num-seqs`.
+2. Run:
+
+```bash
+.venv/bin/python -u "$CAKE_ARTIFACTS/scripts/run_pareto_v2.py" \
+  --root "$CAKE_RUN_ROOT" --model "$CAKE_MODEL" \
+  --dataset-root "$CAKE_RUN_ROOT/datasets" --base-url http://127.0.0.1:8500
+# TP8 + EP: add --concurrencies 1 4 16 64 128 256 --max-prompts 512
+.venv/bin/python "$CAKE_ARTIFACTS/scripts/make_report_seeded.py" \
+  --output seeded "BF16 TP4+EP=$CAKE_RUN_ROOT"
+```
 
 ## Reproduction
 
@@ -186,7 +276,7 @@ The sweep waits after the probes. In another terminal, run the microbenchmark
 on a separate idle H200 once `results/probes.json` exists:
 
 ```bash
-CUDA_VISIBLE_DEVICES=7 .venv/bin/python \
+VLLM_USE_FLASHINFER_CAKE_SAMPLER=1 CUDA_VISIBLE_DEVICES=7 .venv/bin/python \
   benchmarks/kernels/benchmark_cake_sampling.py \
   --logits "$CAKE_RUN_ROOT/results/flash_next_logits.pt" \
   --rounds 3 --repeats 50 \

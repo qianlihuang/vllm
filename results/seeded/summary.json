@@ -1,0 +1,332 @@
+{
+ "BF16 TP4+EP": {
+  "1": {
+   "rounds": 4,
+   "delta_pct": [
+    2.02,
+    1.48,
+    1.33,
+    0.94
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 1.44,
+   "se_pct": 0.22,
+   "mean_delta_per_acceptance_pct": 1.44
+  },
+  "2": {
+   "rounds": 4,
+   "delta_pct": [
+    0.68,
+    1.69,
+    -2.52,
+    -2.65
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": -0.7,
+   "se_pct": 1.11,
+   "mean_delta_per_acceptance_pct": -0.52
+  },
+  "4": {
+   "rounds": 4,
+   "delta_pct": [
+    6.76,
+    1.57,
+    -0.4,
+    2.21
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 2.53,
+   "se_pct": 1.51,
+   "mean_delta_per_acceptance_pct": 2.36
+  },
+  "8": {
+   "rounds": 4,
+   "delta_pct": [
+    0.32,
+    3.18,
+    10.81,
+    -3.79
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 2.63,
+   "se_pct": 3.08,
+   "mean_delta_per_acceptance_pct": 2.56
+  },
+  "16": {
+   "rounds": 4,
+   "delta_pct": [
+    3.66,
+    -5.72,
+    1.63,
+    0.44
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 0.0,
+   "se_pct": 2.02,
+   "mean_delta_per_acceptance_pct": 0.36
+  },
+  "32": {
+   "rounds": 4,
+   "delta_pct": [
+    4.28,
+    -1.58,
+    9.88,
+    9.62
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 5.55,
+   "se_pct": 2.71,
+   "mean_delta_per_acceptance_pct": 5.4
+  }
+ },
+ "FP8 TP2": {
+  "1": {
+   "rounds": 4,
+   "delta_pct": [
+    1.97,
+    1.37,
+    0.73,
+    1.01
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 1.27,
+   "se_pct": 0.27,
+   "mean_delta_per_acceptance_pct": 1.27
+  },
+  "2": {
+   "rounds": 4,
+   "delta_pct": [
+    1.72,
+    -3.03,
+    0.93,
+    0.38
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 0.0,
+   "se_pct": 1.05,
+   "mean_delta_per_acceptance_pct": 0.55
+  },
+  "4": {
+   "rounds": 4,
+   "delta_pct": [
+    -5.94,
+    2.06,
+    -0.8,
+    -4.63
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": -2.33,
+   "se_pct": 1.82,
+   "mean_delta_per_acceptance_pct": -2.84
+  },
+  "8": {
+   "rounds": 4,
+   "delta_pct": [
+    7.79,
+    -5.62,
+    5.68,
+    -1.84
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 1.5,
+   "se_pct": 3.15,
+   "mean_delta_per_acceptance_pct": 1.14
+  },
+  "16": {
+   "rounds": 4,
+   "delta_pct": [
+    -2.92,
+    -0.36,
+    0.08,
+    4.65
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 0.36,
+   "se_pct": 1.57,
+   "mean_delta_per_acceptance_pct": 0.23
+  },
+  "32": {
+   "rounds": 4,
+   "delta_pct": [
+    5.01,
+    1.91,
+    1.95,
+    -3.09
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 1.45,
+   "se_pct": 1.68,
+   "mean_delta_per_acceptance_pct": 1.86
+  }
+ },
+ "FP8 TP8+EP": {
+  "1": {
+   "rounds": 4,
+   "delta_pct": [
+    0.8,
+    0.12,
+    1.05,
+    1.31
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 0.82,
+   "se_pct": 0.26,
+   "mean_delta_per_acceptance_pct": 0.82
+  },
+  "4": {
+   "rounds": 4,
+   "delta_pct": [
+    1.35,
+    4.5,
+    0.14,
+    10.8
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 4.2,
+   "se_pct": 2.39,
+   "mean_delta_per_acceptance_pct": 4.68
+  },
+  "16": {
+   "rounds": 4,
+   "delta_pct": [
+    0.69,
+    12.08,
+    2.82,
+    -10.95
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 1.16,
+   "se_pct": 4.73,
+   "mean_delta_per_acceptance_pct": 1.55
+  },
+  "64": {
+   "rounds": 4,
+   "delta_pct": [
+    0.23,
+    4.13,
+    13.84,
+    -0.66
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 4.39,
+   "se_pct": 3.32,
+   "mean_delta_per_acceptance_pct": 3.87
+  },
+  "128": {
+   "rounds": 4,
+   "delta_pct": [
+    1.39,
+    16.21,
+    -7.91,
+    -6.41
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 0.82,
+   "se_pct": 5.52,
+   "mean_delta_per_acceptance_pct": 0.71
+  },
+  "256": {
+   "rounds": 4,
+   "delta_pct": [
+    -1.14,
+    18.74,
+    -21.11,
+    12.93
+   ],
+   "order": [
+    "baseline first",
+    "cake first",
+    "baseline first",
+    "cake first"
+   ],
+   "mean_delta_pct": 2.35,
+   "se_pct": 8.87,
+   "mean_delta_per_acceptance_pct": 2.53
+  }
+ }
+}
