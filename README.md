@@ -5,6 +5,40 @@ Cake top-k/top-p integration. The benchmark client is the upstream Python
 `vllm bench serve`; the helper only alternates sampling backends and collects its
 JSON results.
 
+## Summary
+
+**Kernels.** Measured on captured Qwen3.8-Flash-Next logits (V=248,320, k=20,
+p=0.95) on H200; BF16 and FP8 logits behave the same.
+
+| Path | Speedup with Cake | Range |
+| --- | --- | --- |
+| Masking | 1.9–4.2× | up to 64 rows, where this PR dispatches it |
+| Direct sampling | 2.3–3.0× | 1–256 rows |
+
+Cake's mask is identical to Triton's on all 512 captured rows.
+
+**End to end with MTP3.** Throughput rises 0.8–1.4% at concurrency 1, measured
+with seeded, order-balanced A/B on BF16 TP4+EP, FP8 TP2 and FP8 TP8+EP.
+
+- Above concurrency 1 the expected gain is below 2% and is not resolved: the
+  per-point SE is 1–3%, and the pooled change over C2–C16 is +0.3% ± 0.5%.
+- With MTP3, Cake only serves the target verification mask, and only up to 64
+  rows, which is 16 requests. Draft sampling ignores top-k/top-p.
+
+**Limits.**
+
+- The 64-row mask cutoff is a conservative dispatch choice, not a Cake limit.
+  Raising it would save about 0.1% of the step for k=20.
+- One measured case is slower with Cake: direct sampling with top-k only,
+  k=1024, at 256 rows and above.
+- Non-speculative decoding was not measured end to end.
+- Cake is opt-in through `VLLM_USE_FLASHINFER_CAKE_SAMPLER=1`.
+
+Details, per-run data and plots are below:
+[seeded A/B](#seeded-order-balanced-ab-2026-10-12),
+[64-row cutoff](#correctness-and-scope), and the
+[first unseeded sweep](#results).
+
 ## Configuration
 
 - Source: `11ccf19a170508a4fb404e1739c8a1ba37414e4b` on
