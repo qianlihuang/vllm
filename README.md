@@ -105,10 +105,12 @@ at concurrency 1.
 
 This rerun reduces the noise of the sweep above in two ways:
 
-- **Fixed seeds.** Every request carries a fixed sampling seed. MRV2 seeds
-  Gumbel sampling by position, so with identical masks both arms generate the
-  same tokens and acceptance stops varying by chance. At concurrency 1,
-  acceptance length matched exactly in every pair.
+- **Fixed seeds.** Every request carries a fixed sampling seed, which removes
+  sampling randomness as a difference between the arms.
+  - It does not make outputs identical. Once the arms batch requests
+    differently, vLLM is not batch-invariant and outputs diverge.
+  - Acceptance length matched exactly in every pair only at concurrency 1.
+    Above that it differed by up to 0.085.
 - **Balanced order.** Four rounds alternate which arm runs first. Each run uses
   max(16, 8 × concurrency) prompts.
 
@@ -136,16 +138,32 @@ Cake − baseline output throughput, mean ± SE over four rounds
 | 256 | | | +2.4% ± 8.9 |
 
 **At concurrency 1**, Cake is faster in all 12 rounds across the three
-configurations, with identical acceptance length.
+configurations, with identical acceptance length. The measured +0.8–1.4% is
+below the ~2.1% that the kernel savings predict.
 
-**Above concurrency 1**, the differences are within run-to-run noise. The
-reasons:
+**Above concurrency 1**, the gain is not resolved. That is not the same as no
+gain.
 
-- With MTP3 the target-side mask has 4 rows per request. Cake's mask path
-  (≤ 64 rows) therefore serves batches of at most 16 requests.
-- Above that, Cake runs only in partial steps. At C32, a call-count probe found
-  about 85 Cake calls in about 1,500 steps, which saves about 14 ms per run.
-- Draft sampling ignores top-k/top-p, so it never uses Cake.
+- **Expected gain.** It falls with concurrency, because each step saves one
+  target-side mask while the step grows with the batch. For BF16 TP4+EP step
+  times it is about 1.7% at C2, 1.2% at C4, and 0.6–0.7% at C8–C16.
+- **Measured.** These expected values are below the per-point SE of 1–3%.
+  Pooled over C2–C16 and all configurations, the measured change is
+  +0.3% ± 0.5%. That is consistent with both zero and the expected gain.
+- **Where Cake runs with MTP3.** Only the target-side verification mask uses
+  top-k/top-p, with 4 rows per request. Draft sampling ignores top-k/top-p.
+- **The 64-row cutoff is this PR's choice, not a Cake limit.** This PR sends
+  the mask to Cake only up to 64 rows, which is 16 requests. The cutoff is
+  conservative because the crossover above it depends on the logit
+  distribution. Direct sampling uses Cake at any batch size.
+- **Raising the cutoff would add little.** It would save 37–82 µs per step at
+  128–256 rows, about 0.1% of the step.
+- **At C32 and above**, Cake therefore runs only in partial steps. At C32, a
+  call-count probe found about 85 Cake calls in about 1,500 steps, which saves
+  about 14 ms per run.
+- **Not measured end to end.** Non-speculative decoding samples one row per
+  request through Cake's direct path at any batch size. It saves 110–490 µs per
+  step from 1 to 256 rows.
 
 **Noise sources**:
 
@@ -308,6 +326,36 @@ sampling has no 64-row cutoff. Its workspace cache is keyed by power-of-two
 batch capacity, so it stays bounded. API availability, supported routes and
 top-k limits are checked before dispatch. Unsupported configurations keep the
 existing backend, including FlashInfer versions without Cake.
+
+**Why the mask cutoff is 64 rows.** An earlier H200 sweep covered three logit
+sources, k ∈ {20, 50, 200, 1024}, with and without top-p, at 1–512 rows
+([data](results/cutoff_sweep_fi071.json); `src=lm` is synthetic, `qwen3_8b` is
+real Qwen3-8B logits).
+
+- At up to 32 rows, the Cake mask path was always faster than Triton.
+- At 64 rows it was faster or within 2%. Two synthetic top-k-only cases were
+  1–2% slower.
+- At 128 rows, the result depended on the input:
+
+  | Input at 128 rows | Cake mask vs Triton |
+  | --- | --- |
+  | Synthetic logits, 155K vocabulary, k = 20/50 | 30–45% slower |
+  | Synthetic logits, 248K vocabulary | about 7% slower |
+  | Real Qwen3-8B logits | tied |
+  | Real Qwen3.8 logits | 11–13% faster |
+  | Real logits, k = 1024 | up to 3.3× faster |
+
+The cause is that the mask path makes extra full-vocabulary passes: a softmax,
+the Cake select, and the mask write. These are cheap while the GPU is
+latency-bound, but cost more once it is bandwidth-bound. Triton runs one CTA per
+row, so its time stays flat to about 128 rows and doubles at 256. The crossover
+is therefore not monotonic. 64 is the largest power of two at which Cake never
+lost by more than 2%; a dispatch that also uses `k_max` could go further.
+
+**Known slower case for direct sampling.** Direct sampling has no cutoff. With
+top-k only and k = 1024 on real Qwen3-8B logits, Cake is slower than
+FlashInfer at 256 and 512 rows: 253 → 380 µs and 477 → 549 µs. Every other
+measured combination was faster with Cake.
 
 Validation performed on H200:
 

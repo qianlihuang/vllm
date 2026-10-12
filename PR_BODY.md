@@ -18,8 +18,8 @@ needs FlashInfer ≥ 0.7.1 (#60948); without it, the existing paths are used.
   | 64 | 334 → 174 | 403 → 146 |
 
 - The retained set matches Triton on all 512 captured rows.
-- End to end, +0.8–1.4% throughput at concurrency 1 and within noise above that,
-  so Cake stays opt-in.
+- End to end with MTP3: +0.8–1.4% throughput at concurrency 1. Above that the
+  expected gain (<2%) is below the benchmark noise. Cake therefore stays opt-in.
 
 ## Validation
 
@@ -31,19 +31,31 @@ pytest tests/v1/sample/test_topk_topp_cake.py tests/v1/sample/test_topk_topp_sam
 E2E setup:
 - Qwen3.8-Flash-Next on H200 with MTP3.
 - SPEED-Bench `throughput_1k` through `vllm bench serve`.
-- Requests carry a fixed seed, so both arms generate the same tokens.
+- Requests carry a fixed sampling seed. Acceptance matches exactly at
+  concurrency 1. Above that the arms batch differently and vLLM is not
+  batch-invariant, so outputs still diverge slightly.
 - Four rounds alternate which arm runs first and toggle only the env var.
 
 E2E result, output throughput change with Cake (mean ± SE):
 
 | Config | Concurrency 1 | Higher concurrency |
 | --- | --- | --- |
-| BF16, TP4+EP | +1.4% ± 0.2% | within noise (C2–C32) |
-| FP8, TP2 | +1.3% ± 0.3% | within noise (C2–C32) |
-| FP8, TP8+EP | +0.8% ± 0.3% | within noise (C4–C256) |
+| BF16, TP4+EP | +1.4% ± 0.2% | not resolved (C2–C32) |
+| FP8, TP2 | +1.3% ± 0.3% | not resolved (C2–C32) |
+| FP8, TP8+EP | +0.8% ± 0.3% | not resolved (C4–C256) |
 
-Cake's mask path covers at most 64 rows, which is 16 requests with MTP3. The
-gain is therefore confined to low concurrency.
+How Cake applies with MTP3:
+- Only the target verification mask uses top-k/top-p; draft sampling ignores
+  them.
+- This PR sends that mask to Cake for up to 64 rows (16 requests). The cutoff is
+  conservative, not a Cake limit.
+
+Why the gain above concurrency 1 is not resolved:
+- The expected gain falls from ~2% at concurrency 1 to <1% at 8–16 requests.
+  Per-point SE is 1–3%.
+- Pooled over C2–C16, the measured change is +0.3% ± 0.5%.
+- Non-speculative decoding uses Cake's direct sampling at any batch size. It was
+  not measured end to end.
 
 Results, plots and reproduction:
 [benchmarks/cake-sampling-h200-20261010](https://github.com/qianlihuang/vllm/tree/benchmarks/cake-sampling-h200-20261010).
