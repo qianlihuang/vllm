@@ -253,12 +253,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_qkvbfg_a",
         )
 
-        self.f_b_proj = ColumnParallelLinear(
+        # f_b and g_b project different inputs (f_a, g_a), so they run as one
+        # batched GEMM over the two halves of this weight (see forward).
+        self.fg_b_proj = MergedColumnParallelLinear(
             self.head_dim,
-            projection_size,
+            [projection_size, projection_size],
             bias=False,
             quant_config=self.quant_config,
-            prefix=f"{prefix}.f_b_proj",
+            prefix=f"{prefix}.fg_b_proj",
         )
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
@@ -303,13 +305,6 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
 
-        self.g_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            projection_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.g_b_proj",
-        )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self.o_proj = RowParallelLinear(
             projection_size,
@@ -458,12 +453,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
-        qkv, beta_raw, f_a, g_a = projected.split(
+        qkv, beta_raw, fg_a = projected.split(
             [
                 3 * self.local_projection_size,
                 self.local_num_heads,
-                self.head_dim,
-                self.head_dim,
+                2 * self.head_dim,
             ],
             dim=-1,
         )
@@ -474,12 +468,16 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # / spec-verify steps then skip the _cast_sigmoid kernel and its fp32
         # intermediate entirely.
         beta = beta_raw.unsqueeze(0)
-        g1 = self.f_b_proj(f_a)[0]
-        g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
-
-        g_proj_states = self.g_b_proj(g_a)[0]
+        # f_b(f_a) and g_b(g_a) in one batched GEMM: [2, T, D] x [2, D, P].
+        fg = torch.bmm(
+            fg_a.view(num_tokens, 2, self.head_dim).transpose(0, 1),
+            self.fg_b_proj.weight.view(
+                2, self.local_projection_size, self.head_dim
+            ).transpose(1, 2),
+        )
+        g1 = fg[0].reshape(1, -1, self.local_num_heads, self.head_dim)
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
-        g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
+        g2 = fg[1].reshape(-1, self.local_num_heads, self.head_dim)
 
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
