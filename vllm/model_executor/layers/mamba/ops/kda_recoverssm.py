@@ -25,9 +25,11 @@ MIN_DOT_COLS = 16
 # H200-tuned: the checkpoint slab streams through shared memory in K chunks.
 VERIFY_K_CHUNK = 32
 VERIFY_NUM_STAGES = 3
-PREP_K_CHUNK = 32
-PREP_NUM_STAGES = 2
+# Prep launch shape by padded window length. Up to BT=8 one K chunk (the whole
+# tile) is fastest; at BT=16 the tile no longer fits and is walked in chunks.
+PREP_K_CHUNK = {2: 128, 4: 128, 8: 128, 16: 64}
 PREP_NUM_WARPS = {2: 1, 4: 1, 8: 1, 16: 2}
+PREP_NUM_STAGES = 2
 
 
 def is_factored_kda_supported(
@@ -394,7 +396,7 @@ def factored_kda_recoverssm_verify(
         K=key_dim,
         BK=block_k,
         BT=block_t,
-        KC=min(PREP_K_CHUNK, block_k),
+        KC=min(PREP_K_CHUNK[block_t], block_k),
         NUM_STAGES=PREP_NUM_STAGES,
         num_warps=PREP_NUM_WARPS[block_t],
     )
