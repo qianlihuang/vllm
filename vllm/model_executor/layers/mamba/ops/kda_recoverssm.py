@@ -25,6 +25,9 @@ MIN_DOT_COLS = 16
 # H200-tuned: the checkpoint slab streams through shared memory in K chunks.
 VERIFY_K_CHUNK = 32
 VERIFY_NUM_STAGES = 3
+PREP_K_CHUNK = 32
+PREP_NUM_STAGES = 2
+PREP_NUM_WARPS = {2: 1, 4: 1, 8: 1, 16: 2}
 
 
 def is_factored_kda_supported(
@@ -84,6 +87,8 @@ def _kda_factored_prep_kernel(
     K: tl.constexpr,
     BK: tl.constexpr,
     BT: tl.constexpr,
+    KC: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -95,90 +100,101 @@ def _kda_factored_prep_kernel(
         tl.int64
     )
     offs_t = tl.arange(0, BT)
-    offs_k = tl.arange(0, BK)
-    mask_k = offs_k < K
+    offs_c = tl.arange(0, KC)
     valid_t = offs_t < eos - bos
-    mask = valid_t[:, None] & mask_k[None, :]
     tokens = (bos + offs_t)[:, None]
-    k = tl.load(
-        k_ptr + tokens * stride_k_token + pid_h * K + offs_k[None, :],
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    raw_g = tl.load(
-        raw_g_ptr + tokens * stride_g_token + pid_h * K + offs_k[None, :],
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    q = tl.load(
-        q_ptr + tokens * stride_q_token + pid_h * K + offs_k[None, :],
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    raw_beta = tl.load(
-        raw_beta_ptr + (bos + offs_t) * stride_beta_token + pid_h,
-        mask=valid_t,
-        other=0.0,
-    ).to(tl.float32)
     a = tl.exp(tl.load(A_log_ptr + pid_h).to(tl.float32))
-    dt_bias = tl.load(dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0).to(
-        tl.float32
-    )
-
     kg_ptr = (
         kg_cache_ptr
         + state_idx * stride_kg_block
         + pid_h * stride_kg_head
         + offs_t[:, None] * stride_kg_pos
     )
-    tl.store(kg_ptr + offs_k[None, :], k, mask=mask)
-    tl.store(kg_ptr + K + offs_k[None, :], raw_g, mask=mask)
-
-    normalized_k = k / tl.sqrt(tl.sum(k * k, axis=1) + 1e-6)[:, None]
-    normalized_q = q / tl.sqrt(tl.sum(q * q, axis=1) + 1e-6)[:, None] * scale
-    gate = lower_bound / (1.0 + tl.exp(-(a * (raw_g + dt_bias[None, :]))))
-    # log D_{t+1}: token t's own decay is applied before its update.
-    log_decay = tl.cumsum(tl.where(mask, gate, 0.0), axis=0)
-    e = tl.exp(log_decay) * normalized_k
-    f = tl.exp(log_decay) * normalized_q
-    c = tl.exp(-log_decay) * normalized_k
     # Every row is written so padding tokens read back zeros, not stale scratch.
     ef_ptr = (
         ef_cache_ptr
         + pid_b * stride_ef_block
         + pid_h * stride_ef_head
         + offs_t[:, None] * stride_ef_tok
-        + offs_k[None, :]
     )
-    tl.store(ef_ptr, e, mask=mask_k[None, :])
-    tl.store(ef_ptr + BT * stride_ef_tok, f, mask=mask_k[None, :])
 
-    if BT >= 16:
-        a_mat = tl.dot(c, tl.trans(e), input_precision="tf32x3")
-        b_mat = tl.dot(c, tl.trans(f), input_precision="tf32x3")
-    else:
-        a_mat = tl.sum(c[:, None, :] * e[None, :, :], axis=2)
-        b_mat = tl.sum(c[:, None, :] * f[None, :, :], axis=2)
-    # u_t is added after the decay, so its own output weight is nk_t . nq_t.
-    diagonal = tl.sum(normalized_k * normalized_q, axis=1)
+    # One pass over K. The l2 norms are per-token scalars, so e / f / c are kept
+    # unnormalized here; the norms scale A / B below and the projection columns
+    # in the verify.
+    k_sq = tl.zeros([BT], dtype=tl.float32)
+    q_sq = tl.zeros([BT], dtype=tl.float32)
+    k_dot_q = tl.zeros([BT], dtype=tl.float32)
+    a_raw = tl.zeros([BT, BT], dtype=tl.float32)
+    b_raw = tl.zeros([BT, BT], dtype=tl.float32)
+    for kc in tl.range(0, BK, KC, num_stages=NUM_STAGES):
+        cols = kc + offs_c
+        mask_c = cols < K
+        mask = valid_t[:, None] & mask_c[None, :]
+        k = tl.load(
+            k_ptr + tokens * stride_k_token + pid_h * K + cols[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        raw_g = tl.load(
+            raw_g_ptr + tokens * stride_g_token + pid_h * K + cols[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        q = tl.load(
+            q_ptr + tokens * stride_q_token + pid_h * K + cols[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        dt_bias = tl.load(dt_bias_ptr + pid_h * K + cols, mask=mask_c, other=0.0).to(
+            tl.float32
+        )
+        tl.store(kg_ptr + cols[None, :], k, mask=mask)
+        tl.store(kg_ptr + K + cols[None, :], raw_g, mask=mask)
+        k_sq += tl.sum(k * k, axis=1)
+        q_sq += tl.sum(q * q, axis=1)
+        k_dot_q += tl.sum(k * q, axis=1)
+        gate = lower_bound / (1.0 + tl.exp(-(a * (raw_g + dt_bias[None, :]))))
+        # log D_{t+1}: token t's own decay is applied before its update.
+        log_decay = tl.cumsum(tl.where(mask, gate, 0.0), axis=0)
+        e = tl.exp(log_decay) * k
+        f = tl.exp(log_decay) * q
+        c = tl.exp(-log_decay) * k
+        tl.store(ef_ptr + cols[None, :], e, mask=mask_c[None, :])
+        tl.store(ef_ptr + BT * stride_ef_tok + cols[None, :], f, mask=mask_c[None, :])
+        if BT >= 16:
+            a_raw += tl.dot(c, tl.trans(e), input_precision="tf32x3")
+            b_raw += tl.dot(c, tl.trans(f), input_precision="tf32x3")
+        else:
+            a_raw += tl.sum(c[:, None, :] * e[None, :, :], axis=2)
+            b_raw += tl.sum(c[:, None, :] * f[None, :, :], axis=2)
+
+    k_scale = 1.0 / tl.sqrt(k_sq + 1e-6)
+    q_scale = scale / tl.sqrt(q_sq + 1e-6)
+    raw_beta = tl.load(
+        raw_beta_ptr + (bos + offs_t) * stride_beta_token + pid_h,
+        mask=valid_t,
+        other=0.0,
+    ).to(tl.float32)
     beta = tl.sigmoid(raw_beta)
+    a_mat = a_raw * k_scale[:, None] * k_scale[None, :]
+    b_mat = b_raw * k_scale[:, None] * q_scale[None, :]
+    # u_t is added after the decay, so its own output weight is nk_t . nq_t.
+    diagonal = k_dot_q * k_scale * q_scale
     row = offs_t[:, None]
     col = offs_t[None, :]
-    # Row t of W is [A[t] | B[t]]; A's unused diagonal carries sigmoid(beta_t).
-    w_ptr = (
-        w_cache_ptr
-        + pid_b * stride_w_block
-        + pid_h * stride_w_head
-        + row * stride_w_tok
-    )
+    # Rows t < BT of W are [A[t] | B[t]], with sigmoid(beta_t) on A's unused
+    # diagonal; row BT holds the column scales of the projection.
+    w_ptr = w_cache_ptr + pid_b * stride_w_block + pid_h * stride_w_head
     tl.store(
-        w_ptr + col,
+        w_ptr + row * stride_w_tok + col,
         tl.where(row < col, a_mat, tl.where(row == col, beta[:, None], 0.0)),
     )
     tl.store(
-        w_ptr + BT + col,
+        w_ptr + row * stride_w_tok + BT + col,
         tl.where(row < col, b_mat, tl.where(row == col, diagonal[:, None], 0.0)),
     )
+    tl.store(w_ptr + BT * stride_w_tok + offs_t, k_scale)
+    tl.store(w_ptr + BT * stride_w_tok + BT + offs_t, q_scale)
 
 
 @triton.jit
@@ -250,14 +266,14 @@ def _kda_factored_verify_kernel(
         mask=mask_v[:, None] & (offs_e < query_len)[None, :],
         other=0.0,
     ).to(tl.float32)
+    w_base = w_cache_ptr + pid_b * stride_w_block + pid_h * stride_w_head
     w_all = tl.load(
-        w_cache_ptr
-        + pid_b * stride_w_block
-        + pid_h * stride_w_head
-        + offs_t[:, None] * stride_w_tok
-        + offs_e[None, :],
+        w_base + offs_t[:, None] * stride_w_tok + offs_e[None, :],
         mask=in_window[None, :],
         other=0.0,
+    )
+    column_scale = tl.load(
+        w_base + BT * stride_w_tok + offs_e, mask=in_window, other=0.0
     )
     # S_0 @ [e | f] in K chunks: the checkpoint slab streams through shared
     # memory instead of sitting in registers, which keeps occupancy up.
@@ -284,7 +300,7 @@ def _kda_factored_verify_kernel(
     # residual[:, t] = v_t - S_t' . nk_t and residual[:, BT + t] = -o_t once every
     # earlier u_i has been folded in through its row of W, so the triangular
     # solve never goes back to memory.
-    residual = v - projection
+    residual = v - projection * column_scale[None, :]
     for t in tl.static_range(SPEC_QUERY_LEN):
         valid = t < query_len
         w = tl.sum(tl.where(offs_t[:, None] == t, w_all, 0.0), axis=0)
@@ -342,7 +358,7 @@ def factored_kda_recoverssm_verify(
     ef_width = max(MIN_DOT_COLS, 2 * block_t)
     ef_cache, w_cache = current_workspace_manager().get_simultaneous(
         ((batch, num_heads, 2 * block_t, key_dim), torch.float32),
-        ((batch, num_heads, block_t, 2 * block_t), torch.float32),
+        ((batch, num_heads, block_t + 1, 2 * block_t), torch.float32),
     )
     block_k = triton.next_power_of_2(key_dim)
     _kda_factored_prep_kernel[(batch, num_heads)](
@@ -378,7 +394,9 @@ def factored_kda_recoverssm_verify(
         K=key_dim,
         BK=block_k,
         BT=block_t,
-        num_warps=1 if block_t < 16 else 8,
+        KC=min(PREP_K_CHUNK, block_k),
+        NUM_STAGES=PREP_NUM_STAGES,
+        num_warps=PREP_NUM_WARPS[block_t],
     )
     # Wider V tiles once there are enough programs to fill the GPU.
     block_v = 32 if batch * num_heads >= 384 else 16
