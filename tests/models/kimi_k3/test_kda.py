@@ -233,7 +233,10 @@ def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
     if parameter_layout == "glm":
         A_log = A_log.view(1, 1, heads, 1)
         dt_bias = dt_bias.view(-1)
-    blocks = torch.tensor([2, 17, 0, 9], device=DEVICE, dtype=torch.int32)
+    # A block-table column, strided like the eager / mixed-batch metadata.
+    blocks = torch.tensor(
+        [[2, 5], [17, 6], [0, 7], [9, 8]], device=DEVICE, dtype=torch.int32
+    )[:, 0]
     cu = torch.tensor(
         [0, query_len, tokens - 1, tokens, tokens], device=DEVICE, dtype=torch.int32
     )

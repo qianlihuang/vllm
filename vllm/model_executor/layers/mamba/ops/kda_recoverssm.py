@@ -22,6 +22,9 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.worker.workspace import current_workspace_manager
 
 MIN_DOT_COLS = 16
+_PREP_NUM_WARPS = 1
+_VERIFY_BKC = 32
+_VERIFY_NUM_STAGES = 3
 
 
 def is_factored_kda_supported(
@@ -174,6 +177,50 @@ def _kda_factored_prep_kernel(
 
 
 @triton.jit
+def _kda_factored_solve_tile(
+    projection,
+    v,
+    w_all,
+    out_ptr,
+    correction_ptr,
+    bos,
+    query_len,
+    pid_h,
+    offs_v,
+    offs_e,
+    offs_t,
+    stride_out_token,
+    stride_correction_pos,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    SPEC_QUERY_LEN: tl.constexpr,
+):
+    mask_v = offs_v < V
+    # residual[:, t] = v_t - S_t' . nk_t and residual[:, BT + t] = -o_t once every
+    # earlier u_i has been folded in through its row of W, so the triangular
+    # solve never goes back to memory.
+    residual = v - projection
+    for t in tl.static_range(SPEC_QUERY_LEN):
+        valid = t < query_len
+        w = tl.sum(tl.where(offs_t[:, None] == t, w_all, 0.0), axis=0)
+        # w[t] is sigmoid(beta_t).
+        u = tl.sum(tl.where(offs_e[None, :] == t, residual * w[None, :], 0.0), axis=1)
+        u = tl.where(valid, u, 0.0)
+        residual -= u[:, None] * w[None, :]
+        out = -tl.sum(tl.where(offs_e[None, :] == BT + t, residual, 0.0), axis=1)
+        tl.store(
+            out_ptr + (bos + t) * stride_out_token + pid_h * V + offs_v,
+            out,
+            mask=valid & mask_v,
+        )
+        tl.store(
+            correction_ptr + t * stride_correction_pos + offs_v,
+            u,
+            mask=valid & mask_v,
+        )
+
+
+@triton.jit
 def _kda_factored_verify_kernel(
     v_ptr,
     state_ptr,
@@ -207,6 +254,8 @@ def _kda_factored_verify_kernel(
     BT: tl.constexpr,
     SPEC_QUERY_LEN: tl.constexpr,
     EF_WIDTH: tl.constexpr,
+    BKC: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -218,11 +267,9 @@ def _kda_factored_verify_kernel(
     query_len = eos - bos
     state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(tl.int64)
 
-    offs_k = tl.arange(0, BK)
-    offs_v = pid_v * BV + tl.arange(0, BV)
     offs_e = tl.arange(0, EF_WIDTH)
-    mask_k = offs_k < K
-    mask_v = offs_v < V
+    offs_t = tl.arange(0, BT)
+    offs_v = pid_v * BV + tl.arange(0, BV)
     # Column t < BT is token t's e-projection, column BT + t its f-projection.
     in_window = offs_e < 2 * BT
     if state_idx <= null_block_id:
@@ -230,37 +277,18 @@ def _kda_factored_verify_kernel(
             tl.store(
                 out_ptr + (bos + t) * stride_out_token + pid_h * V + offs_v,
                 tl.zeros([BV], dtype=tl.float32),
-                mask=(t < query_len) & mask_v,
+                mask=(t < query_len) & (offs_v < V),
             )
         return
 
-    state = tl.load(
-        state_ptr
-        + state_idx * stride_state_block
-        + pid_h * stride_state_head
-        + offs_v[:, None] * stride_state_v
-        + offs_k[None, :],
-        mask=mask_v[:, None] & mask_k[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    # Token-major in memory so prep stores and this load stay coalesced along K.
-    ef = tl.trans(
-        tl.load(
-            ef_cache_ptr
-            + pid_b * stride_ef_block
-            + pid_h * stride_ef_head
-            + offs_e[:, None] * stride_ef_tok
-            + offs_k[None, :],
-            mask=in_window[:, None] & mask_k[None, :],
-            other=0.0,
-        )
-    )
+    state_base = state_ptr + state_idx * stride_state_block + pid_h * stride_state_head
+    ef_base = ef_cache_ptr + pid_b * stride_ef_block + pid_h * stride_ef_head
+    mask_v = offs_v < V
     v = tl.load(
         v_ptr + (bos + offs_e)[None, :] * stride_v_token + pid_h * V + offs_v[:, None],
         mask=mask_v[:, None] & (offs_e < query_len)[None, :],
         other=0.0,
     ).to(tl.float32)
-    offs_t = tl.arange(0, BT)
     w_all = tl.load(
         w_cache_ptr
         + pid_b * stride_w_block
@@ -270,34 +298,46 @@ def _kda_factored_verify_kernel(
         mask=in_window[None, :],
         other=0.0,
     )
+    # S_0 @ [e | f] in K chunks: the checkpoint slab streams through shared
+    # memory instead of sitting in registers, which keeps occupancy up.
+    offs_kc = tl.arange(0, BKC)
+    projection = tl.zeros([BV, EF_WIDTH], dtype=tl.float32)
+    for kc in tl.range(0, BK, BKC, num_stages=NUM_STAGES):
+        state = tl.load(
+            state_base + offs_v[:, None] * stride_state_v + (kc + offs_kc)[None, :],
+            mask=mask_v[:, None] & ((kc + offs_kc) < K)[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        # Token-major in memory so prep stores stay coalesced along K.
+        ef = tl.load(
+            ef_base + offs_e[None, :] * stride_ef_tok + (kc + offs_kc)[:, None],
+            mask=((kc + offs_kc) < K)[:, None] & in_window[None, :],
+            other=0.0,
+        )
+        projection = tl.dot(state, ef, projection, input_precision="tf32x3")
     correction_ptr = (
         correction_cache_ptr
         + state_idx * stride_correction_block
         + pid_h * stride_correction_head
     )
-
-    # residual[:, t] = v_t - S_t' . nk_t and residual[:, BT + t] = -o_t once every
-    # earlier u_i has been folded in through its row of W, so the triangular
-    # solve never goes back to memory.
-    residual = v - tl.dot(state, ef, input_precision="tf32x3")
-    for t in tl.static_range(SPEC_QUERY_LEN):
-        valid = t < query_len
-        w = tl.sum(tl.where(offs_t[:, None] == t, w_all, 0.0), axis=0)
-        # w[t] is sigmoid(beta_t).
-        u = tl.sum(tl.where(offs_e[None, :] == t, residual * w[None, :], 0.0), axis=1)
-        u = tl.where(valid, u, 0.0)
-        residual -= u[:, None] * w[None, :]
-        out = -tl.sum(tl.where(offs_e[None, :] == BT + t, residual, 0.0), axis=1)
-        tl.store(
-            out_ptr + (bos + t) * stride_out_token + pid_h * V + offs_v,
-            out,
-            mask=valid & mask_v,
-        )
-        tl.store(
-            correction_ptr + t * stride_correction_pos + offs_v,
-            u,
-            mask=valid & mask_v,
-        )
+    _kda_factored_solve_tile(
+        projection,
+        v,
+        w_all,
+        out_ptr,
+        correction_ptr,
+        bos,
+        query_len,
+        pid_h,
+        offs_v,
+        offs_e,
+        offs_t,
+        stride_out_token,
+        stride_correction_pos,
+        V,
+        BT,
+        SPEC_QUERY_LEN,
+    )
 
 
 def factored_kda_recoverssm_verify(
@@ -373,7 +413,7 @@ def factored_kda_recoverssm_verify(
         K=key_dim,
         BK=block_k,
         BT=block_t,
-        num_warps=1,
+        num_warps=_PREP_NUM_WARPS,
     )
     block_v = 16
     _kda_factored_verify_kernel[(triton.cdiv(value_dim, block_v), batch, num_heads)](
@@ -409,6 +449,8 @@ def factored_kda_recoverssm_verify(
         BT=block_t,
         SPEC_QUERY_LEN=spec_query_len,
         EF_WIDTH=ef_width,
+        BKC=min(_VERIFY_BKC, block_k),
+        NUM_STAGES=_VERIFY_NUM_STAGES,
         num_warps=1,
     )
     return out
