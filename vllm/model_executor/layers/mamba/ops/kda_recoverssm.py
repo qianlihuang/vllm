@@ -22,9 +22,9 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.worker.workspace import current_workspace_manager
 
 MIN_DOT_COLS = 16
-# H200-tuned: the checkpoint slab streams through shared memory in K chunks.
+# H200-tuned: the checkpoint slab is read in K chunks, so it never sits in
+# registers whole.
 VERIFY_K_CHUNK = 32
-VERIFY_NUM_STAGES = 3
 # Prep launch shape by padded window length. Up to BT=8 one K chunk (the whole
 # tile) is fastest; at BT=16 the tile no longer fits and is walked in chunks.
 PREP_K_CHUNK = {2: 128, 4: 128, 8: 128, 16: 64}
@@ -246,6 +246,26 @@ def _kda_factored_prep_kernel(
 
 
 @triton.jit
+def _tf32_hi(x):
+    return tl.inline_asm_elementwise(
+        "cvt.rna.tf32.f32 $0, $1;", "=r,r", [x], dtype=tl.float32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _tf32_lo(x):
+    # x - tf32(x) as a single op, so the split stays in the dot operand layout.
+    return tl.inline_asm_elementwise(
+        "{ .reg .b32 t; cvt.rna.tf32.f32 t, $1; sub.f32 $0, $1, t; }",
+        "=r,r",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _kda_factored_verify_kernel(
     v_ptr,
     state_ptr,
@@ -280,7 +300,6 @@ def _kda_factored_verify_kernel(
     SPEC_QUERY_LEN: tl.constexpr,
     EF_WIDTH: tl.constexpr,
     BKC: tl.constexpr,
-    NUM_STAGES: tl.constexpr,
 ):
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -325,11 +344,13 @@ def _kda_factored_verify_kernel(
     column_scale = tl.load(
         w_base + BT * stride_w_tok + offs_e, mask=in_window, other=0.0
     )
-    # S_0 @ [e | f] in K chunks: the checkpoint slab streams through shared
-    # memory instead of sitting in registers, which keeps occupancy up.
+    # S_0 @ [e | f] in K chunks as tf32x3, split by hand. With
+    # input_precision="tf32x3", or with a software-pipelined loop, Triton 3.8
+    # stages the split halves through extra shared memory, which doubles the
+    # verify time on H200.
     offs_kc = tl.arange(0, BKC)
     projection = tl.zeros([BV, EF_WIDTH], dtype=tl.float32)
-    for kc in tl.range(0, BK, BKC, num_stages=NUM_STAGES):
+    for kc in tl.range(0, BK, BKC, num_stages=1):
         state = tl.load(
             state_base + offs_v[:, None] * stride_state_v + (kc + offs_kc)[None, :],
             mask=mask_v[:, None] & ((kc + offs_kc) < K)[None, :],
@@ -341,7 +362,11 @@ def _kda_factored_verify_kernel(
             mask=((kc + offs_kc) < K)[:, None] & in_window[None, :],
             other=0.0,
         )
-        projection = tl.dot(state, ef, projection, input_precision="tf32x3")
+        state_hi = _tf32_hi(state)
+        ef_hi = _tf32_hi(ef)
+        projection = tl.dot(_tf32_lo(state), ef_hi, projection, input_precision="tf32")
+        projection = tl.dot(state_hi, _tf32_lo(ef), projection, input_precision="tf32")
+        projection = tl.dot(state_hi, ef_hi, projection, input_precision="tf32")
     correction_ptr = (
         correction_cache_ptr
         + state_idx * stride_correction_block
@@ -447,8 +472,9 @@ def factored_kda_recoverssm_verify(
         NUM_STAGES=PREP_NUM_STAGES,
         num_warps=PREP_NUM_WARPS[block_t],
     )
-    # Wider V tiles once there are enough programs to fill the GPU.
-    block_v = 32 if batch * num_heads >= 384 else 16
+    # Wider V tiles once there are enough programs to fill the GPU; longer
+    # windows amortize their larger triangular solve over more rows.
+    block_v = (64 if block_t >= 8 else 32) if batch * num_heads >= 384 else 16
     _kda_factored_verify_kernel[(triton.cdiv(value_dim, block_v), batch, num_heads)](
         v,
         checkpoint_state,
@@ -483,7 +509,6 @@ def factored_kda_recoverssm_verify(
         SPEC_QUERY_LEN=spec_query_len,
         EF_WIDTH=ef_width,
         BKC=min(VERIFY_K_CHUNK, block_k),
-        NUM_STAGES=VERIFY_NUM_STAGES,
         num_warps=1,
     )
     return out
