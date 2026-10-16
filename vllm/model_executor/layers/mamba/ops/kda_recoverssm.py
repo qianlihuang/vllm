@@ -274,6 +274,8 @@ def _kda_factored_verify_kernel(
         mask=in_window[None, :],
         other=0.0,
     )
+    # e / f are stored unnormalized; this applies the per-token l2 normalization
+    # (and q's 1/sqrt(K) scale) to their projection columns.
     column_scale = tl.load(
         w_base + BT * stride_w_tok + offs_e, mask=in_window, other=0.0
     )
