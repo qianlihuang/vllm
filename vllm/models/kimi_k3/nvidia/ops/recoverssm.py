@@ -689,8 +689,6 @@ def kda_recoverssm_verify(
             checkpoint_state, kg_cache, spec_query_len, lower_bound
         )
         and correction_cache.stride(-1) == 1
-        and query_start_loc.stride(0) == 1
-        and state_indices.stride(0) == 1
     ):
         assert lower_bound is not None
         return factored_kda_recoverssm_verify(
