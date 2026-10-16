@@ -204,7 +204,7 @@ def naive_recurrent_kda(
 
 
 @pytest.mark.parametrize("parameter_layout", ["kimi", "glm"])
-@pytest.mark.parametrize("query_len", [4, 8])
+@pytest.mark.parametrize("query_len", [4, 8, 9, 12])
 @torch.inference_mode()
 def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
     monkeypatch: pytest.MonkeyPatch, parameter_layout: str, query_len: int
@@ -271,7 +271,7 @@ def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
             with torch.cuda.graph(graph):
                 output = shared.factored_kda_recoverssm_verify(*args)
             q.normal_()
-            g.fill_(50.0)  # Saturate the gate, including the T=8 decay limit.
+            g.fill_(50.0)  # Saturate the gate, up to the T=12 decay limit.
             lengths = [query_len - 2, query_len, 1, 0]
             cu[1] = query_len - 2
             graph.replay()

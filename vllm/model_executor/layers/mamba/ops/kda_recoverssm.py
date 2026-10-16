@@ -43,7 +43,8 @@ def is_factored_kda_supported(
         and checkpoint.stride(-1) == 1
         and kg_cache.dtype == torch.bfloat16
         and kg_cache.stride(-1) == 1
-        and 2 <= query_len <= 8
+        # Beyond 12 tokens at the -5 bound, the tf32x3 low half of e_t underflows.
+        and 2 <= query_len <= 12
         and lower_bound is not None
         and -5.0 <= lower_bound < 0.0
     )
@@ -152,8 +153,12 @@ def _kda_factored_prep_kernel(
     tl.store(ef_ptr, e, mask=mask_k[None, :])
     tl.store(ef_ptr + BT * stride_ef_tok, f, mask=mask_k[None, :])
 
-    a_mat = tl.sum(c[:, None, :] * e[None, :, :], axis=2)
-    b_mat = tl.sum(c[:, None, :] * f[None, :, :], axis=2)
+    if BT >= 16:
+        a_mat = tl.dot(c, tl.trans(e), input_precision="tf32x3")
+        b_mat = tl.dot(c, tl.trans(f), input_precision="tf32x3")
+    else:
+        a_mat = tl.sum(c[:, None, :] * e[None, :, :], axis=2)
+        b_mat = tl.sum(c[:, None, :] * f[None, :, :], axis=2)
     # u_t is added after the decay, so its own output weight is nk_t . nq_t.
     diagonal = tl.sum(normalized_k * normalized_q, axis=1)
     beta = tl.sigmoid(raw_beta)
@@ -373,7 +378,7 @@ def factored_kda_recoverssm_verify(
         K=key_dim,
         BK=block_k,
         BT=block_t,
-        num_warps=1,
+        num_warps=1 if block_t < 16 else 8,
     )
     # Wider V tiles once there are enough programs to fill the GPU.
     block_v = 32 if batch * num_heads >= 384 else 16
