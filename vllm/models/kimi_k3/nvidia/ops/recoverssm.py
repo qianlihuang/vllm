@@ -9,6 +9,10 @@ from typing import Any
 import torch
 
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.model_executor.layers.mamba.ops.kda_recoverssm import (
+    factored_kda_recoverssm_verify,
+    is_factored_kda_supported,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -678,6 +682,33 @@ def kda_recoverssm_verify(
     if total_tokens == 0:
         return out
 
+    # A single request cannot amortize the factored path's extra prep launch.
+    if (
+        batch > 1
+        and is_factored_kda_supported(
+            checkpoint_state, kg_cache, spec_query_len, lower_bound
+        )
+        and correction_cache.stride(-1) == 1
+    ):
+        assert lower_bound is not None
+        return factored_kda_recoverssm_verify(
+            q,
+            k,
+            v,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            lower_bound,
+            checkpoint_state,
+            correction_cache,
+            kg_cache,
+            query_start_loc,
+            state_indices,
+            spec_query_len,
+            out,
+        )
+
     block_k = triton.next_power_of_2(key_dim)
     block_v = min(triton.next_power_of_2(value_dim), 32)
     grid = (triton.cdiv(value_dim, block_v), batch, num_heads)
@@ -777,7 +808,8 @@ class KDARecoverSSMCommitContext:
         checkpoints = [layer.kv_cache[1] for layer in layers]
         correction_caches = [layer.kv_cache[2] for layer in layers]
         kg_caches = [layer.kv_cache[3] for layer in layers]
-        A_log = [layer.A_log for layer in layers]
+        # GLM-5.3-Flash stores A_log as [1, 1, H, 1]; the kernels index it flat.
+        A_log = [layer.A_log.reshape(-1) for layer in layers]
         dt_bias = [
             layer.dt_bias.view(layer.local_num_heads, layer.head_dim)
             for layer in layers

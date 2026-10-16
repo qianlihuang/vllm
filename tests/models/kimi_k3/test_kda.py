@@ -89,6 +89,7 @@ def test_kda_warmup_skips_missing_metadata(monkeypatch):
     )
     layer = object.__new__(nvidia_kda.KimiK3DeltaAttention)
     object.__setattr__(layer, "prefix", "language_model.model.layers.0.self_attn")
+    object.__setattr__(layer, "use_recoverssm", False)
     empty = torch.empty(0, device=DEVICE)
 
     assert layer._forward(empty, empty, empty, empty, empty) is None
@@ -201,6 +202,136 @@ def naive_recurrent_kda(
     if not output_final_state:
         S = None
     return o.to(dtype), S
+
+
+@pytest.mark.parametrize("parameter_layout", ["kimi", "glm"])
+@pytest.mark.parametrize("query_len", [4, 8, 9, 12])
+@pytest.mark.parametrize("heads", [4, 64, 96])
+@torch.inference_mode()
+def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
+    monkeypatch: pytest.MonkeyPatch, parameter_layout: str, query_len: int, heads: int
+):
+    """Batch scratch must not be indexed by persistent checkpoint block IDs."""
+    capability = current_platform.get_device_capability()
+    if not current_platform.is_cuda() or capability is None or capability.major != 9:
+        pytest.skip("The factored KDA specialization requires CUDA SM90")
+    from vllm.model_executor.layers.mamba.ops import kda_recoverssm as shared
+    from vllm.v1.worker import workspace
+
+    monkeypatch.setattr(
+        workspace, "_manager", workspace.WorkspaceManager(torch.device(DEVICE))
+    )
+    torch.manual_seed(42)
+    dim, lower_bound = 128, -5.0
+    lengths = [query_len, query_len - 2, 1, 0]
+    tokens = sum(lengths)
+    q, k, v, g = [
+        torch.randn(1, tokens, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+        for _ in range(4)
+    ]
+    beta = torch.randn(1, tokens, heads, device=DEVICE, dtype=torch.bfloat16)
+    A_log = 0.1 * torch.randn(heads, device=DEVICE)
+    dt_bias = 0.1 * torch.randn(heads, dim, device=DEVICE)
+    if parameter_layout == "glm":
+        A_log = A_log.view(1, 1, heads, 1)
+        dt_bias = dt_bias.view(-1)
+    # A block-table column, strided like the eager / mixed-batch metadata.
+    blocks = torch.tensor(
+        [[2, 5], [17, 6], [0, 7], [9, 8]], device=DEVICE, dtype=torch.int32
+    )[:, 0]
+    cu = torch.tensor(
+        [0, query_len, tokens - 1, tokens, tokens], device=DEVICE, dtype=torch.int32
+    )
+    state = 0.05 * torch.randn(20, heads, dim, dim, device=DEVICE)
+    before = state.clone()
+    correction = torch.full((20, heads, query_len, dim), float("nan"), device=DEVICE)
+    kg = torch.full(
+        (20, heads, query_len, 2 * dim),
+        float("nan"),
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    args = (
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log.reshape(-1),
+        dt_bias.reshape(-1),
+        lower_bound,
+        state,
+        correction,
+        kg,
+        cu,
+        blocks,
+        query_len,
+    )
+    for replay in (False, True):
+        if replay:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = shared.factored_kda_recoverssm_verify(*args)
+            q.normal_()
+            g.fill_(50.0)  # Saturate the gate, up to the T=12 decay limit.
+            lengths = [query_len - 2, query_len, 1, 0]
+            cu[1] = query_len - 2
+            graph.replay()
+        else:
+            output = shared.factored_kda_recoverssm_verify(*args)
+        qn = q.float() / torch.sqrt(q.float().square().sum(-1, keepdim=True) + 1e-6)
+        kn = k.float() / torch.sqrt(k.float().square().sum(-1, keepdim=True) + 1e-6)
+        gate = lower_bound * torch.sigmoid(
+            A_log.reshape(heads, 1).exp() * (g.float() + dt_bias.reshape(heads, dim))
+        )
+        begin = 0
+        for row, length in enumerate(lengths):
+            end = begin + length
+            if row < 2:
+                ref_state = before[blocks[row]].clone()
+                for offset, token in enumerate(range(begin, end)):
+                    ref_state *= gate[0, token, :, None, :].exp()
+                    ref_correction = (
+                        v[0, token].float()
+                        - (ref_state * kn[0, token, :, None, :]).sum(-1)
+                    ) * beta[0, token].float().sigmoid()[:, None]
+                    torch.testing.assert_close(
+                        correction[blocks[row], :, offset],
+                        ref_correction,
+                        atol=2e-5,
+                        rtol=2e-4,
+                    )
+                    ref_state += ref_correction[:, :, None] * kn[0, token, :, None, :]
+                    ref_out = (ref_state * qn[0, token, :, None, :]).sum(-1) * dim**-0.5
+                    torch.testing.assert_close(
+                        output[0, token],
+                        ref_out.to(output.dtype),
+                        atol=2e-2,
+                        rtol=2e-2,
+                    )
+                torch.testing.assert_close(
+                    kg[blocks[row], :, :length, :dim],
+                    k[0, begin:end].transpose(0, 1),
+                    atol=0,
+                    rtol=0,
+                )
+                torch.testing.assert_close(
+                    kg[blocks[row], :, :length, dim:],
+                    g[0, begin:end].transpose(0, 1),
+                    atol=0,
+                    rtol=0,
+                )
+            elif length:
+                torch.testing.assert_close(
+                    output[:, begin:end],
+                    torch.zeros_like(output[:, begin:end]),
+                    atol=0,
+                    rtol=0,
+                )
+            begin = end
+        assert torch.isnan(correction[[0, 9]]).all()
+        assert torch.isnan(kg[[0, 9]]).all()
+        torch.testing.assert_close(state, before, atol=0, rtol=0)
 
 
 def assert_close(
@@ -693,6 +824,7 @@ def test_kda_spec_decode_correctness(
     ],
 )
 @pytest.mark.parametrize("accepted", [(2, 8), (3, 4), (5, 8)])
+@pytest.mark.usefixtures("workspace_init")
 @torch.inference_mode()
 def test_kda_recoverssm_verify_and_group_commit(
     accepted: tuple[int, int],
