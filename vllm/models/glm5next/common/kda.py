@@ -37,6 +37,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
+from vllm.model_executor.layers.mamba.ops.kda_recoverssm import (
+    reserve_factored_kda_workspace,
+)
 from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import (
@@ -373,6 +376,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 "GLM-5.3-Flash supports --use-replayssm only with speculative decoding"
             )
         self.spec_query_len = 1 + self.num_spec
+        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         # Process-global conv-state layout, resolved once here instead of on
         # every _forward call (it reads an env-derived flag each time).
         self._conv_state_dim_first = is_conv_state_dim_first()
@@ -546,13 +550,23 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
 
-        if attn_metadata_raw is None:
-            return
-
-        assert isinstance(attn_metadata_raw, dict)
-        attn_metadata_narrowed = attn_metadata_raw.get(self.prefix)
+        if attn_metadata_raw is not None:
+            assert isinstance(attn_metadata_raw, dict)
+        attn_metadata_narrowed = (
+            None if attn_metadata_raw is None else attn_metadata_raw.get(self.prefix)
+        )
         if attn_metadata_narrowed is None:
             # Profile/warmup dummy runs may omit mamba-family metadata.
+            if self.use_recoverssm:
+                reserve_factored_kda_workspace(
+                    self._max_num_seqs,
+                    self.local_num_heads,
+                    self.head_dim,
+                    self.spec_query_len,
+                    self.get_state_dtype()[1],
+                    self.model_config.dtype,
+                    self.gate_lower_bound,
+                )
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
         has_initial_state = attn_metadata_narrowed.has_initial_state

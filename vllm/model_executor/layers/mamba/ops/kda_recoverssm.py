@@ -32,9 +32,10 @@ PREP_NUM_WARPS = {2: 1, 4: 1, 8: 1, 16: 2}
 PREP_NUM_STAGES = 2
 
 
-def is_factored_kda_supported(
-    checkpoint: torch.Tensor,
-    kg_cache: torch.Tensor,
+def _is_factored_kda_config_supported(
+    state_dtype: torch.dtype,
+    record_dtype: torch.dtype,
+    head_dim: int,
     query_len: int,
     lower_bound: float | None,
 ) -> bool:
@@ -43,16 +44,61 @@ def is_factored_kda_supported(
         current_platform.is_cuda()
         and capability is not None
         and capability.major == 9
-        and checkpoint.dtype == torch.float32
-        and checkpoint.shape[-2:] == (128, 128)
-        and checkpoint.stride(-1) == 1
-        and kg_cache.dtype == torch.bfloat16
-        and kg_cache.stride(-1) == 1
+        and state_dtype == torch.float32
+        and record_dtype == torch.bfloat16
+        and head_dim == 128
         # Beyond 12 tokens at the -5 bound, the tf32x3 low half of e_t underflows.
         and 2 <= query_len <= 12
         and lower_bound is not None
         and -5.0 <= lower_bound < 0.0
     )
+
+
+def is_factored_kda_supported(
+    checkpoint: torch.Tensor,
+    kg_cache: torch.Tensor,
+    query_len: int,
+    lower_bound: float | None,
+) -> bool:
+    return (
+        checkpoint.shape[-2:] == (128, 128)
+        and checkpoint.stride(-1) == 1
+        and kg_cache.stride(-1) == 1
+        and _is_factored_kda_config_supported(
+            checkpoint.dtype,
+            kg_cache.dtype,
+            checkpoint.shape[-1],
+            query_len,
+            lower_bound,
+        )
+    )
+
+
+def _factored_workspace_specs(batch: int, heads: int, dim: int, block_t: int):
+    return (
+        ((batch, heads, 2 * block_t, dim), torch.float32),
+        ((batch, heads, block_t + 1, 2 * block_t), torch.float32),
+    )
+
+
+def reserve_factored_kda_workspace(
+    max_batch: int,
+    heads: int,
+    dim: int,
+    query_len: int,
+    state_dtype: torch.dtype,
+    record_dtype: torch.dtype,
+    lower_bound: float | None,
+) -> None:
+    """Reserve eager-batch capacity before CUDA graph capture locks the workspace."""
+    if max_batch > 1 and _is_factored_kda_config_supported(
+        state_dtype, record_dtype, dim, query_len, lower_bound
+    ):
+        current_workspace_manager().get_simultaneous(
+            *_factored_workspace_specs(
+                max_batch, heads, dim, triton.next_power_of_2(query_len)
+            )
+        )
 
 
 @triton.jit
@@ -361,8 +407,7 @@ def factored_kda_recoverssm_verify(
     block_t = triton.next_power_of_2(spec_query_len)
     ef_width = max(MIN_DOT_COLS, 2 * block_t)
     ef_cache, w_cache = current_workspace_manager().get_simultaneous(
-        ((batch, num_heads, 2 * block_t, key_dim), torch.float32),
-        ((batch, num_heads, block_t + 1, 2 * block_t), torch.float32),
+        *_factored_workspace_specs(batch, num_heads, key_dim, block_t)
     )
     block_k = triton.next_power_of_2(key_dim)
     _kda_factored_prep_kernel[(batch, num_heads)](

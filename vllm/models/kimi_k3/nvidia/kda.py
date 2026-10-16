@@ -37,6 +37,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
+from vllm.model_executor.layers.mamba.ops.kda_recoverssm import (
+    reserve_factored_kda_workspace,
+)
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
 )
@@ -596,6 +599,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 "Kimi-K3 supports --use-replayssm only with speculative decoding"
             )
         self.spec_query_len = 1 + self.num_spec
+        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
 
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]
         assert kda_config is not None, "linear_attn_config must be set"
@@ -911,19 +915,29 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
-        if attn_metadata_raw is None:
+        if attn_metadata_raw is not None:
+            assert isinstance(attn_metadata_raw, dict)
+        attn_metadata_narrowed = (
+            None if attn_metadata_raw is None else attn_metadata_raw.get(self.prefix)
+        )
+        if attn_metadata_narrowed is None:
+            if self.use_recoverssm:
+                reserve_factored_kda_workspace(
+                    self._max_num_seqs,
+                    self.local_num_heads,
+                    self.head_dim,
+                    self.spec_query_len,
+                    self.get_state_dtype()[1],
+                    self.model_config.dtype,
+                    self.gate_lower_bound,
+                )
             return
-
         from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
             chunk_kda_with_fused_gate,
             fused_recurrent_kda,
             fused_recurrent_kda_packed_decode,
         )
 
-        assert isinstance(attn_metadata_raw, dict)
-        attn_metadata_narrowed = attn_metadata_raw.get(self.prefix)
-        if attn_metadata_narrowed is None:
-            return
         assert isinstance(attn_metadata_narrowed, KimiK3KDAMetadata)
         m = attn_metadata_narrowed
         has_initial_state = m.has_initial_state

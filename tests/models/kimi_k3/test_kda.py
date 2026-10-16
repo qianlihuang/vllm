@@ -89,6 +89,7 @@ def test_kda_warmup_skips_missing_metadata(monkeypatch):
     )
     layer = object.__new__(nvidia_kda.KimiK3DeltaAttention)
     object.__setattr__(layer, "prefix", "language_model.model.layers.0.self_attn")
+    object.__setattr__(layer, "use_recoverssm", False)
     empty = torch.empty(0, device=DEVICE)
 
     assert layer._forward(empty, empty, empty, empty, empty) is None
@@ -205,9 +206,10 @@ def naive_recurrent_kda(
 
 @pytest.mark.parametrize("parameter_layout", ["kimi", "glm"])
 @pytest.mark.parametrize("query_len", [4, 8, 9, 12])
+@pytest.mark.parametrize("heads", [4, 64, 96])
 @torch.inference_mode()
 def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
-    monkeypatch: pytest.MonkeyPatch, parameter_layout: str, query_len: int
+    monkeypatch: pytest.MonkeyPatch, parameter_layout: str, query_len: int, heads: int
 ):
     """Batch scratch must not be indexed by persistent checkpoint block IDs."""
     capability = current_platform.get_device_capability()
@@ -220,7 +222,7 @@ def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
         workspace, "_manager", workspace.WorkspaceManager(torch.device(DEVICE))
     )
     torch.manual_seed(42)
-    heads, dim, lower_bound = 4, 128, -5.0
+    dim, lower_bound = 128, -5.0
     lengths = [query_len, query_len - 2, 1, 0]
     tokens = sum(lengths)
     q, k, v, g = [
