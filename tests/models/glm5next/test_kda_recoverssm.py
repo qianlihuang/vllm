@@ -28,6 +28,7 @@ DEVICE = "cuda"
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("num_spec", [4, 7])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.usefixtures("workspace_init")
 @torch.inference_mode()
 def test_glm_kda_recoverssm_matches_native_spec(
     monkeypatch: pytest.MonkeyPatch, num_spec: int, state_dtype: torch.dtype

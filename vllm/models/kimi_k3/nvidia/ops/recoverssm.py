@@ -9,6 +9,11 @@ from typing import Any
 import torch
 
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.model_executor.layers.mamba.ops.kda_recoverssm import (
+    _commit_factored_kda_state_kernel,
+    factored_kda_recoverssm_verify,
+    is_factored_kda_supported,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -438,6 +443,7 @@ def _commit_kda_state_kernel(
     NUM_HEADS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
+    SPEC_QUERY_LEN: tl.constexpr,
 ):
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -677,6 +683,33 @@ def kda_recoverssm_verify(
         raise ValueError("KDA RecoverSSM inputs must be on the same device")
     if total_tokens == 0:
         return out
+
+    if (
+        is_factored_kda_supported(
+            checkpoint_state, kg_cache, spec_query_len, lower_bound
+        )
+        and correction_cache.stride(-1) == 1
+        and query_start_loc.stride(0) == 1
+        and state_indices.stride(0) == 1
+    ):
+        assert lower_bound is not None
+        return factored_kda_recoverssm_verify(
+            q,
+            k,
+            v,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            lower_bound,
+            checkpoint_state,
+            correction_cache,
+            kg_cache,
+            query_start_loc,
+            state_indices,
+            spec_query_len,
+            out,
+        )
 
     block_k = triton.next_power_of_2(key_dim)
     block_v = min(triton.next_power_of_2(value_dim), 32)
@@ -1014,13 +1047,21 @@ class KDARecoverSSMCommitContext:
         state_ref = self.checkpoints[0]
         _, num_heads, value_dim, key_dim = state_ref.shape
         block_k = triton.next_power_of_2(key_dim)
-        block_v = min(triton.next_power_of_2(value_dim), 32)
+        use_factored = is_factored_kda_supported(
+            state_ref, self.kg_caches[0], self.spec_query_len, self.lower_bound
+        )
+        block_v = 16 if use_factored else min(triton.next_power_of_2(value_dim), 32)
+        commit_kernel = (
+            _commit_factored_kda_state_kernel
+            if use_factored
+            else _commit_kda_state_kernel
+        )
         grid = (
             triton.cdiv(value_dim, block_v),
             batch,
             num_layers * num_heads,
         )
-        _commit_kda_state_kernel[grid](
+        commit_kernel[grid](
             state_ref,
             self.state_base_addrs,
             self.state_block_strides,
@@ -1061,7 +1102,8 @@ class KDARecoverSSMCommitContext:
             NUM_HEADS=num_heads,
             USE_LOWER_BOUND=self.lower_bound is not None,
             ALIGN_MODE=block_table is not None,
-            num_warps=4,
+            SPEC_QUERY_LEN=self.spec_query_len,
+            num_warps=1 if use_factored else 4,
             num_stages=2,
         )
 
