@@ -205,11 +205,18 @@ def naive_recurrent_kda(
 
 
 @pytest.mark.parametrize("parameter_layout", ["kimi", "glm"])
-@pytest.mark.parametrize("query_len", [4, 8, 9, 12])
+@pytest.mark.parametrize(
+    ("query_len", "weak_checkpoint"),
+    [(2, False), (4, False), (4, True), (8, False), (9, False), (12, False)],
+)
 @pytest.mark.parametrize("heads", [4, 64, 96])
 @torch.inference_mode()
 def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
-    monkeypatch: pytest.MonkeyPatch, parameter_layout: str, query_len: int, heads: int
+    monkeypatch: pytest.MonkeyPatch,
+    parameter_layout: str,
+    query_len: int,
+    weak_checkpoint: bool,
+    heads: int,
 ):
     """Batch scratch must not be indexed by persistent checkpoint block IDs."""
     capability = current_platform.get_device_capability()
@@ -232,6 +239,20 @@ def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
     beta = torch.randn(1, tokens, heads, device=DEVICE, dtype=torch.bfloat16)
     A_log = 0.1 * torch.randn(heads, device=DEVICE)
     dt_bias = 0.1 * torch.randn(heads, dim, device=DEVICE)
+    if weak_checkpoint:
+        # Keep checkpoint projections large enough to exercise the TF32 low half.
+        g.fill_(-12.0)
+        A_log.zero_()
+        dt_bias.zero_()
+
+        def strided_tokens(tensor):
+            shape = list(tensor.shape)
+            shape[1] *= 2
+            view = torch.empty(shape, device=DEVICE, dtype=tensor.dtype)[:, ::2]
+            view.copy_(tensor)
+            return view
+
+        q, k, v, g, beta = (strided_tokens(x) for x in (q, k, v, g, beta))
     if parameter_layout == "glm":
         A_log = A_log.view(1, 1, heads, 1)
         dt_bias = dt_bias.view(-1)
@@ -243,6 +264,10 @@ def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
         [0, query_len, tokens - 1, tokens, tokens], device=DEVICE, dtype=torch.int32
     )
     state = 0.05 * torch.randn(20, heads, dim, dim, device=DEVICE)
+    if weak_checkpoint:
+        storage = torch.empty(20, heads, dim + 1, dim, device=DEVICE)
+        storage[:, :, :dim].copy_(state * 80)
+        state = storage[:, :, :dim]
     before = state.clone()
     correction = torch.full((20, heads, query_len, dim), float("nan"), device=DEVICE)
     kg = torch.full(
@@ -251,6 +276,18 @@ def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
         device=DEVICE,
         dtype=torch.bfloat16,
     )
+    output_buffer = torch.empty_like(v)
+    if weak_checkpoint:
+        correction = torch.full(
+            (20, heads, query_len + 1, dim), float("nan"), device=DEVICE
+        )[:, :, :query_len]
+        kg = torch.full(
+            (20, heads, query_len + 1, 2 * dim),
+            float("nan"),
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )[:, :, :query_len]
+        output_buffer = strided_tokens(output_buffer)
     args = (
         q,
         k,
@@ -266,6 +303,7 @@ def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
         cu,
         blocks,
         query_len,
+        output_buffer,
     )
     for replay in (False, True):
         if replay:
@@ -273,7 +311,7 @@ def test_factored_recoverssm_preserves_raw_records_with_sparse_blocks(
             with torch.cuda.graph(graph):
                 output = shared.factored_kda_recoverssm_verify(*args)
             q.normal_()
-            g.fill_(50.0)  # Saturate the gate, up to the T=12 decay limit.
+            g.fill_(-12.0 if weak_checkpoint else 50.0)
             lengths = [query_len - 2, query_len, 1, 0]
             cu[1] = query_len - 2
             graph.replay()

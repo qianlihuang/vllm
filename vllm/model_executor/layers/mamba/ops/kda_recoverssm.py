@@ -350,11 +350,15 @@ def _kda_factored_verify_kernel(
     # verify time on H200.
     offs_kc = tl.arange(0, BKC)
     projection = tl.zeros([BV, EF_WIDTH], dtype=tl.float32)
-    for kc in tl.range(0, BK, BKC, num_stages=1):
+    # Longer windows spill when the K loop is unrolled.
+    for kc in tl.range(
+        0, BK, BKC, num_stages=1, loop_unroll_factor=2 if BT <= 8 else 1
+    ):
         state = tl.load(
             state_base + offs_v[:, None] * stride_state_v + (kc + offs_kc)[None, :],
             mask=mask_v[:, None] & ((kc + offs_kc) < K)[None, :],
             other=0.0,
+            eviction_policy="evict_first",
         ).to(tl.float32)
         # Token-major in memory so prep stores stay coalesced along K.
         ef = tl.load(
