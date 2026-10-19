@@ -207,7 +207,16 @@ def naive_recurrent_kda(
 @pytest.mark.parametrize("parameter_layout", ["kimi", "glm"])
 @pytest.mark.parametrize(
     ("query_len", "weak_checkpoint"),
-    [(2, False), (4, False), (4, True), (8, False), (9, False), (12, False)],
+    [
+        (2, False),
+        (2, True),
+        (3, False),
+        (4, False),
+        (4, True),
+        (8, False),
+        (9, False),
+        (12, False),
+    ],
 )
 @pytest.mark.parametrize("heads", [4, 64, 96])
 @torch.inference_mode()

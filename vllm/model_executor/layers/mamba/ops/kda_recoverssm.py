@@ -21,7 +21,6 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.worker.workspace import current_workspace_manager
 
-MIN_DOT_COLS = 16
 # H200-tuned: the checkpoint slab is read in K chunks, so it never sits in
 # registers whole.
 VERIFY_K_CHUNK = 32
@@ -350,9 +349,13 @@ def _kda_factored_verify_kernel(
     # verify time on H200.
     offs_kc = tl.arange(0, BKC)
     projection = tl.zeros([BV, EF_WIDTH], dtype=tl.float32)
-    # Longer windows spill when the K loop is unrolled.
+    # Full unrolling fits short windows once their unused columns are removed.
     for kc in tl.range(
-        0, BK, BKC, num_stages=1, loop_unroll_factor=2 if BT <= 8 else 1
+        0,
+        BK,
+        BKC,
+        num_stages=1,
+        loop_unroll_factor=4 if BT <= 4 else (2 if BT <= 8 else 1),
     ):
         state = tl.load(
             state_base + offs_v[:, None] * stride_state_v + (kc + offs_kc)[None, :],
@@ -434,7 +437,7 @@ def factored_kda_recoverssm_verify(
     assert checkpoint_state.stride(-1) == 1 and kg_cache.stride(-1) == 1
     assert correction_cache.stride(-1) == 1
     block_t = triton.next_power_of_2(spec_query_len)
-    ef_width = max(MIN_DOT_COLS, 2 * block_t)
+    ef_width = 2 * block_t
     ef_cache, w_cache = current_workspace_manager().get_simultaneous(
         *_factored_workspace_specs(batch, num_heads, key_dim, block_t)
     )
