@@ -480,6 +480,51 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
         torch.testing.assert_close(logits, reference, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_candidate_warmup_covers_runtime_specializations(monkeypatch, dtype):
+    """Long requests and sliced bounds must not compile after startup warmup."""
+    from vllm.model_executor.kernels.attention.dsa import candidate_blocks
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        for select in (True, False):
+            candidate_blocks.register_candidate_block_warmup(
+                select=select,
+                block_size=8,
+                topk_blocks=16,
+                row_repeats=(1, 4),
+                logits_dtypes=(dtype,),
+            )
+    registry.warmup()
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("candidate kernel compiled after registered warmup")
+
+    for kernel in (
+        candidate_blocks._block_scores_kernel,
+        candidate_blocks._store_candidates_kernel,
+        candidate_blocks._candidate_flags_kernel,
+        candidate_blocks._mask_candidates_kernel,
+    ):
+        monkeypatch.setattr(kernel, "compile", unexpected_compile)
+
+    for width, repeat, packed in ((73, 1, False), (32768, 4, True), (131071, 1, True)):
+        logits = torch.randn(2 * repeat, width, device="cuda", dtype=dtype)
+        # Offset metadata is common when a prefill chunk slices the batch.
+        starts = torch.tensor([0, 3, 0], device="cuda", dtype=torch.int32)[1:]
+        ends = torch.tensor([0, width, width - 7], device="cuda", dtype=torch.int32)[1:]
+        candidates = torch.empty(2 * repeat, 16, device="cuda", dtype=torch.int32)
+        candidate_blocks.select_candidate_blocks(
+            logits, starts if packed else None, ends, 16, 8, candidates, repeat
+        )
+        candidate_blocks.apply_candidate_mask(
+            logits, starts if packed else None, ends, candidates, 8, repeat
+        )
+    torch.accelerator.synchronize()
+
+
 # --- DeepGEMM sparse-MQA indexer path (V4.1 two-level candidate filtering) ---
 
 

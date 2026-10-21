@@ -27,6 +27,9 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask as _apply_candidate_mask,
 )
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    register_candidate_block_warmup as _register_candidate_block_warmup,
+)
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
 )
 from vllm.model_executor.layers.indexer_topk import (
@@ -1085,6 +1088,24 @@ class SparseAttnIndexer(CustomOp):
 
                 _PACK_DCP_TOPK_CANDIDATES_KERNEL.register_warmup()
                 _STABLE_TOPK_FROM_GATHERED_CANDIDATES_KERNEL.register_warmup()
+
+            if self.candidate_blocks is not None and self.candidate_block_size:
+                # Short startup batches never reach both the DeepSelect path
+                # and the padded spec-decode row repeat, so register the
+                # specializations the first long or padded request would
+                # otherwise compile mid-inference.
+                logits_dtypes: tuple[torch.dtype, ...] = (torch.float32,)
+                if self.topk_backend == "deep_select" and self.dcp_world_size == 1:
+                    # Decode keeps its BF16 logits only for DeepSelect's top-k.
+                    logits_dtypes += (torch.bfloat16,)
+                spec_tokens = vllm_config.num_speculative_tokens
+                _register_candidate_block_warmup(
+                    select=self.candidate_write,
+                    block_size=self.candidate_block_size,
+                    topk_blocks=self.candidate_blocks.shape[1],
+                    row_repeats=(1, 1 + spec_tokens) if spec_tokens else (1,),
+                    logits_dtypes=logits_dtypes,
+                )
 
     @property
     def cp_kv_cache_interleave_size(self) -> int:

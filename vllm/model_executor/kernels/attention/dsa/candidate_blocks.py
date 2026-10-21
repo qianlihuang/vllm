@@ -9,6 +9,11 @@ from vllm.model_executor.layers.indexer_topk import (
     get_deep_select_stride_requirement,
     is_deep_select_supported,
 )
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DispatchSpec,
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 
@@ -18,7 +23,13 @@ def _max_with_nan(a, b):
     return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
 
 
-@triton.jit(do_not_specialize=["width", "nblocks"])
+# Row strides follow the logits width, which changes with every batch, and the
+# row bounds are scalar loads; neither may pick a Triton specialization, or the
+# first long request recompiles mid-inference.
+@triton.jit(
+    do_not_specialize=["stride_row", "stride_scores", "width", "nblocks"],
+    do_not_specialize_on_alignment=["starts", "ends"],
+)
 def _block_scores_kernel(
     logits,
     starts,
@@ -67,7 +78,10 @@ def _block_scores_kernel(
         tl.store(scores + row * stride_scores + blocks, reduced, blocks < num_blocks)
 
 
-@triton.jit(do_not_specialize=["k"])
+@triton.jit(
+    do_not_specialize=["k"],
+    do_not_specialize_on_alignment=["output"],
+)
 def _store_candidates_kernel(
     values,
     indices,
@@ -90,7 +104,10 @@ def _store_candidates_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["width", "nblocks"])
+@triton.jit(
+    do_not_specialize=["width", "nblocks"],
+    do_not_specialize_on_alignment=["candidates", "starts"],
+)
 def _candidate_flags_kernel(
     candidates,
     starts,
@@ -121,7 +138,10 @@ def _candidate_flags_kernel(
     tl.store(flags + row * (nblocks + 1) + block, 1, (cols < K) & (block >= 0))
 
 
-@triton.jit(do_not_specialize=["width", "nblocks"])
+@triton.jit(
+    do_not_specialize=["stride_row", "width", "nblocks"],
+    do_not_specialize_on_alignment=["starts", "ends"],
+)
 def _mask_candidates_kernel(
     logits,
     starts,
@@ -152,6 +172,219 @@ def _mask_candidates_kernel(
         -float("inf"),
         (cols < width) & ~(valid & keep),
     )
+
+
+def _block_scores_warmup_inputs(
+    *,
+    block_size: int,
+    row_repeats: tuple[int, ...],
+    logits_dtypes: tuple[torch.dtype, ...],
+) -> list[dict[str, object]]:
+    return [
+        dict(
+            logits=TritonWarmupTensor(dtype, shape=(1, block_size)),
+            starts=starts,
+            ends=TritonWarmupTensor(torch.int32),
+            scores=TritonWarmupTensor(dtype),
+            valid_blocks=TritonWarmupTensor(torch.int32),
+            block_size=block_size,
+            row_repeat=row_repeat,
+            full_width=full_width,
+        )
+        for dtype in logits_dtypes
+        for row_repeat in row_repeats
+        for full_width in (False, True)
+        # CUDA prefill starts every row at column zero; the ROCm and XPU
+        # paths pass explicit row starts instead.
+        for starts in (None, TritonWarmupTensor(torch.int32))
+    ]
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_block_scores_kernel, warmup_inputs=_block_scores_warmup_inputs
+)
+def _launch_block_scores(
+    logits: torch.Tensor,
+    starts: torch.Tensor | None,
+    ends: torch.Tensor,
+    scores: torch.Tensor,
+    valid_blocks: torch.Tensor,
+    block_size: int,
+    row_repeat: int,
+    full_width: bool,
+) -> DispatchSpec:
+    rows, width = logits.shape
+    return (rows, 32), dict(
+        stride_row=logits.stride(0),
+        stride_col=logits.stride(1),
+        stride_start=starts.stride(0) if starts is not None else 0,
+        stride_end=ends.stride(0),
+        stride_scores=scores.stride(0),
+        width=width,
+        nblocks=triton.cdiv(width, block_size),
+        BLOCK_SIZE=block_size,
+        HAS_STARTS=starts is not None,
+        ROW_REPEAT=row_repeat,
+        TILE=128,
+        FULL_WIDTH=full_width,
+    )
+
+
+def _store_candidates_warmup_inputs(
+    *, topk_blocks: int, logits_dtypes: tuple[torch.dtype, ...]
+) -> list[dict[str, object]]:
+    return [
+        dict(
+            values=TritonWarmupTensor(dtype),
+            indices=TritonWarmupTensor(torch.int64),
+            output=TritonWarmupTensor(torch.int32, shape=(1, topk_blocks)),
+            k=1,
+            topk_blocks=topk_blocks,
+        )
+        for dtype in logits_dtypes
+    ]
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_store_candidates_kernel, warmup_inputs=_store_candidates_warmup_inputs
+)
+def _launch_store_candidates(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    output: torch.Tensor,
+    k: int,
+    topk_blocks: int,
+) -> DispatchSpec:
+    return (values.shape[0], triton.cdiv(topk_blocks, 256)), dict(
+        out_stride_row=output.stride(0),
+        out_stride_col=output.stride(1),
+        k=k,
+        OUT_K=topk_blocks,
+        TILE=256,
+    )
+
+
+def _candidate_flags_warmup_inputs(
+    *, block_size: int, topk_blocks: int, row_repeats: tuple[int, ...]
+) -> list[dict[str, object]]:
+    return [
+        dict(
+            candidates=TritonWarmupTensor(torch.int32, shape=(1, topk_blocks)),
+            starts=starts,
+            flags=TritonWarmupTensor(torch.uint8),
+            width=block_size,
+            block_size=block_size,
+            row_repeat=row_repeat,
+        )
+        for row_repeat in row_repeats
+        for starts in (None, TritonWarmupTensor(torch.int32))
+    ]
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_candidate_flags_kernel, warmup_inputs=_candidate_flags_warmup_inputs
+)
+def _launch_candidate_flags(
+    candidates: torch.Tensor,
+    starts: torch.Tensor | None,
+    flags: torch.Tensor,
+    width: int,
+    block_size: int,
+    row_repeat: int,
+) -> DispatchSpec:
+    return (candidates.shape[0],), dict(
+        stride_row=candidates.stride(0),
+        stride_col=candidates.stride(1),
+        stride_start=starts.stride(0) if starts is not None else 0,
+        width=width,
+        nblocks=triton.cdiv(width, block_size),
+        BLOCK_SIZE=block_size,
+        K=candidates.shape[1],
+        HAS_STARTS=starts is not None,
+        ROW_REPEAT=row_repeat,
+    )
+
+
+def _mask_candidates_warmup_inputs(
+    *,
+    block_size: int,
+    row_repeats: tuple[int, ...],
+    logits_dtypes: tuple[torch.dtype, ...],
+) -> list[dict[str, object]]:
+    return [
+        dict(
+            logits=TritonWarmupTensor(dtype, shape=(1, block_size)),
+            starts=starts,
+            ends=TritonWarmupTensor(torch.int32),
+            flags=TritonWarmupTensor(torch.uint8),
+            block_size=block_size,
+            row_repeat=row_repeat,
+        )
+        for dtype in logits_dtypes
+        for row_repeat in row_repeats
+        for starts in (None, TritonWarmupTensor(torch.int32))
+    ]
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_mask_candidates_kernel, warmup_inputs=_mask_candidates_warmup_inputs
+)
+def _launch_mask_candidates(
+    logits: torch.Tensor,
+    starts: torch.Tensor | None,
+    ends: torch.Tensor,
+    flags: torch.Tensor,
+    block_size: int,
+    row_repeat: int,
+) -> DispatchSpec:
+    rows, width = logits.shape
+    return (rows, triton.cdiv(width, 1024)), dict(
+        stride_row=logits.stride(0),
+        stride_col=logits.stride(1),
+        stride_start=starts.stride(0) if starts is not None else 0,
+        stride_end=ends.stride(0),
+        width=width,
+        nblocks=triton.cdiv(width, block_size),
+        BLOCK_SIZE=block_size,
+        HAS_STARTS=starts is not None,
+        ROW_REPEAT=row_repeat,
+        TILE=1024,
+    )
+
+
+def register_candidate_block_warmup(
+    *,
+    select: bool,
+    block_size: int,
+    topk_blocks: int,
+    row_repeats: tuple[int, ...],
+    logits_dtypes: tuple[torch.dtype, ...],
+) -> None:
+    """Warm the kernels one indexer's candidate step launches.
+
+    The candidate source (``select``) scores and publishes blocks; the other
+    indexers only mask their logits with them. Short startup batches reach
+    neither the DeepSelect path nor the spec-decode row repeat, so every
+    reachable specialization is compiled here instead.
+    """
+    if select:
+        _launch_block_scores.register_warmup(
+            block_size=block_size,
+            row_repeats=row_repeats,
+            logits_dtypes=logits_dtypes,
+        )
+        _launch_store_candidates.register_warmup(
+            topk_blocks=topk_blocks, logits_dtypes=logits_dtypes
+        )
+    else:
+        _launch_candidate_flags.register_warmup(
+            block_size=block_size, topk_blocks=topk_blocks, row_repeats=row_repeats
+        )
+        _launch_mask_candidates.register_warmup(
+            block_size=block_size,
+            row_repeats=row_repeats,
+            logits_dtypes=logits_dtypes,
+        )
 
 
 def select_candidate_blocks(
@@ -191,37 +424,23 @@ def select_candidate_blocks(
     else:
         scores = logits.new_empty((rows, nblocks))
     valid_blocks = torch.empty(rows, dtype=torch.int32, device=logits.device)
-    _block_scores_kernel[(rows, 32)](
+    _launch_block_scores(
         logits,
         row_ks,
         row_ke,
         scores,
         valid_blocks,
-        *logits.stride(),
-        row_ks.stride(0) if row_ks is not None else 0,
-        row_ke.stride(0),
-        scores.stride(0),
-        width,
-        nblocks,
         block_size,
-        row_ks is not None,
         row_repeat,
-        TILE=128,
-        FULL_WIDTH=not use_deep_select,
+        full_width=not use_deep_select,
     )
     if use_deep_select:
         deep_select_topk(scores, topk_blocks, end=valid_blocks, output_idx=out)
         return
     # Keep the existing top-k tie behavior.
     top = scores.topk(min(topk_blocks, nblocks), dim=-1)
-    _store_candidates_kernel[(rows, triton.cdiv(topk_blocks, 256))](
-        top.values,
-        top.indices,
-        out,
-        *out.stride(),
-        top.values.shape[1],
-        topk_blocks,
-        256,
+    _launch_store_candidates(
+        top.values, top.indices, out, top.values.shape[1], topk_blocks
     )
 
 
@@ -240,32 +459,7 @@ def apply_candidate_mask(
         return
     nblocks = triton.cdiv(width, block_size)
     flags = torch.empty((rows, nblocks + 1), device=logits.device, dtype=torch.uint8)
-    start_stride = row_ks.stride(0) if row_ks is not None else 0
-    _candidate_flags_kernel[(rows,)](
-        candidate_blocks,
-        row_ks,
-        flags,
-        *candidate_blocks.stride(),
-        start_stride,
-        width,
-        nblocks,
-        block_size,
-        candidate_blocks.shape[1],
-        row_ks is not None,
-        row_repeat,
+    _launch_candidate_flags(
+        candidate_blocks, row_ks, flags, width, block_size, row_repeat
     )
-    _mask_candidates_kernel[(rows, triton.cdiv(width, 1024))](
-        logits,
-        row_ks,
-        row_ke,
-        flags,
-        *logits.stride(),
-        start_stride,
-        row_ke.stride(0),
-        width,
-        nblocks,
-        block_size,
-        row_ks is not None,
-        row_repeat,
-        1024,
-    )
+    _launch_mask_candidates(logits, row_ks, row_ke, flags, block_size, row_repeat)
