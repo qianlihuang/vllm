@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end tests for the FlashInfer MoE-EP adapter on real Blackwell GPUs.
+"""End-to-end tests for the FlashInfer MoE-EP adapters on Hopper and Blackwell.
 
 Each test spawns one process per GPU, bootstraps vLLM's expert-parallel
 groups, builds a ``FlashInferMoeEp`` adapter from bf16 expert weights at the
@@ -367,3 +367,150 @@ def test_adapter_kwargs_match_installed_flashinfer(
         else moe_ep.DeepGemmMegaMoeConfig
     )
     assert isinstance(mega_config.megakernel, expected)
+
+
+@torch.inference_mode()
+def _sm90_nvfp4_mixed_moe(env: dict[str, str], world: int, tp_size: int) -> None:
+    from vllm.forward_context import get_forward_context, set_forward_context
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    set_env_vars_and_device(env)
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", rank)
+    dp_size = world // tp_size
+    dp_rank = rank // tp_size
+    cfg = VllmConfig()
+    cfg.parallel_config.tensor_parallel_size = tp_size
+    cfg.parallel_config.data_parallel_size = dp_size
+    cfg.parallel_config.data_parallel_rank = dp_rank
+    cfg.parallel_config.enable_expert_parallel = True
+    cfg.parallel_config.all2all_backend = "passthrough"
+    cfg.kernel_config.moe_backend = "flashinfer_moe_ep_cutedsl"
+    cfg.scheduler_config.max_num_batched_tokens = 512 * tp_size
+    init_workspace_manager(device)
+    hidden, intermediate, experts, topk = 4096, 2048, 288, 8
+    with set_current_vllm_config(cfg):
+        ensure_model_parallel_initialized(tp_size, 1)
+        for quantized in (True, False):
+            with torch.device(device):
+                layer = FusedMoEFactory(
+                    num_experts=experts,
+                    top_k=topk,
+                    hidden_size=hidden,
+                    intermediate_size=intermediate,
+                    params_dtype=torch.bfloat16,
+                    quant_config=(
+                        ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True)
+                        if quantized
+                        else None
+                    ),
+                    swiglu_limit=10.0,
+                    is_sequence_parallel=tp_size > 1,
+                    prefix=f"operator_{quantized}",
+                )
+            routed = layer.routed_experts
+            local = experts // world
+            routed.w13_weight.zero_()
+            routed.w2_weight.zero_()
+            for i in range(local):
+                e = rank * local + i
+                w1 = 2.0 / (1 + e % 2)
+                w2 = 1.75 * (1 + e % 3)
+                routed.w13_weight[i, 0, 0] = 4 if quantized else w1
+                routed.w13_weight[i, intermediate, 0] = 4 if quantized else w1
+                routed.w2_weight[i, e, 0] = 4 if quantized else w2
+            if quantized:
+                routed.w13_weight_scale.fill_(128)
+                routed.w2_weight_scale.fill_(224)
+                for i in range(local):
+                    e = rank * local + i
+                    routed.w13_weight_scale_2[i].fill_(1 / (128 * (1 + e % 2)))
+                    routed.w2_weight_scale_2[i].fill_((1 + e % 3) / 256)
+                routed.w13_input_scale.fill_(1)
+                routed.w2_input_scale.fill_(1)
+            routed.quant_method.process_weights_after_loading(routed)
+
+            def case(routed, lengths, graph=False, quantized=quantized):
+                n = (lengths[dp_rank] + tp_size - 1) // tp_size
+                x = torch.zeros(n, hidden, dtype=torch.bfloat16, device=device)
+                x[:, 0] = torch.tensor([2.0, 4.0, 8.0], device=device)[
+                    torch.arange(n, device=device) % 3
+                ]
+                x[:, 1] = 7.0
+                ids = (
+                    (
+                        (torch.arange(n, device=device) + rank * 7)[:, None]
+                        + torch.arange(topk, device=device)[None, :] * (experts // topk)
+                    )
+                    .remainder(experts)
+                    .to(torch.int32)
+                )
+                weights = (
+                    torch.tensor([2.0 ** -(i + 1) for i in range(topk)], device=device)
+                    .expand(n, -1)
+                    .contiguous()
+                )
+                expected = torch.zeros(n, hidden, device=device)
+                for j in range(topk):
+                    e = ids[:, j].long()
+                    g = (x[:, 0].float() * 2 / (1 + e % 2)).clamp(max=10)
+                    value = torch.nn.functional.silu(g) * g
+                    value *= weights[:, j]
+                    if quantized:
+                        # FI's intermediate E4M3 quantizer uses UE8M0 scales.
+                        scale = torch.exp2(torch.ceil(torch.log2(value.abs() / 448)))
+                        value = (value / scale).to(torch.float8_e4m3fn).float() * scale
+                    value *= 1.75 * (1 + e % 3)
+                    expected.scatter_add_(1, e[:, None], value[:, None])
+                with set_forward_context(
+                    None,
+                    cfg,
+                    num_tokens=lengths[dp_rank],
+                    num_tokens_across_dp=torch.tensor(lengths, dtype=torch.int32),
+                ):
+                    metadata = get_forward_context().dp_metadata
+                    assert metadata is not None
+                    with metadata.sp_local_sizes(tp_size):
+                        y = routed.forward_modular(x, weights, ids)
+                        torch.accelerator.synchronize()
+                        if graph:
+                            torch.distributed.barrier()
+                            captured = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(captured):
+                                y = routed.forward_modular(x, weights, ids)
+                            captured.replay()
+                            captured.replay()
+                            torch.accelerator.synchronize()
+                assert torch.isfinite(y).all()
+                torch.testing.assert_close(
+                    y, expected.to(torch.bfloat16), rtol=0.008, atol=0.001
+                )
+                torch.distributed.barrier()
+                if rank == 0:
+                    print(
+                        f"PASS NVFP4={quantized} lengths={lengths} graph={graph}",
+                        flush=True,
+                    )
+
+            for n in (1, 16, 64, 257):
+                case(routed, [n * tp_size] * dp_size)
+            case(routed, [0] + [3 * i * tp_size for i in range(1, dp_size)])
+            case(routed, [16 * tp_size] * dp_size, graph=True)
+            case(routed, [257 * tp_size] * dp_size, graph=True)
+            del routed, layer
+            torch.accelerator.memory.empty_cache()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Requires SM90"
+)
+@pytest.mark.parametrize("world_size,tp_size", [(4, 1), (8, 1), (4, 2)])
+def test_sm90_nvfp4_and_bf16_mtp_experts(world_size: int, tp_size: int):
+    if torch.cuda.get_device_properties().multi_processor_count not in (78, 132):
+        pytest.skip("FlashInfer SM90 NVFP4 requires 78 or 132 SMs")
+    if torch.accelerator.device_count() < world_size:
+        pytest.skip(f"Requires {world_size} NVLink-connected Hopper GPUs")
+    pytest.importorskip("flashinfer.megamoe")
+    distributed_run(_sm90_nvfp4_mixed_moe, world_size, tp_size)

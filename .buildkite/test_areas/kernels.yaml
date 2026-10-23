@@ -906,12 +906,14 @@ steps:
   - csrc/quantization/w8a8/cutlass/moe/
   - csrc/moe/
   - tests/kernels/moe
+  - tests/models/test_deepseek_v4_fi_moe_ep.py
   - vllm/model_executor/layers/fused_moe/
   - vllm/model_executor/layers/quantization/
   - vllm/distributed/device_communicators/
   - vllm/config
   commands:
     - pytest -v -s kernels/moe/test_moe_layer.py
+    - pytest -v -s models/test_deepseek_v4_fi_moe_ep.py -k sm90_nvfp4
   mirror:
     amd:
       label: ":amd: (MI355) FusedMoE Layer Kernels"

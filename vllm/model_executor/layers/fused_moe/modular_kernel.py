@@ -1325,7 +1325,14 @@ class FusedMoEKernelModularImpl:
         # kernels. CUDAGraph compatible all2all kernels like the DeepEP
         # low-latency kernels are always batched and can never run into
         # the tensor.numel() == 0 case.
-        if M_full == 0:
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.passthrough import (
+            PassThroughPrepareAndFinalize,
+        )
+
+        # Internally communicating experts must participate with no local tokens.
+        if M_full == 0 and not isinstance(
+            self.prepare_finalize, PassThroughPrepareAndFinalize
+        ):
             out_dim = self.fused_experts.output_hidden_dim(a1q.size(-1))
             return a1q.new_empty((*a1q.shape[:-1], out_dim), dtype=in_dtype)
 
@@ -1333,8 +1340,8 @@ class FusedMoEKernelModularImpl:
             self._allocate_buffers(
                 in_dtype,
                 a1q.device,
-                M_full,
-                M_full,
+                max(1, M_full),
+                max(1, M_full),
                 N,
                 K,
                 top_k,
@@ -1344,6 +1351,9 @@ class FusedMoEKernelModularImpl:
                 activation,
             )
         )
+
+        if M_full == 0:
+            fused_out = fused_out[:0]
 
         use_output_alias = (
             not fused_out_is_specialized

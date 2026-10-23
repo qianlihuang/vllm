@@ -9,7 +9,7 @@ import torch
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config.kernel import MoEBackend
+from vllm.config.kernel import FLASHINFER_MOE_EP_BACKENDS, MoEBackend
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -303,10 +303,9 @@ def select_unquantized_moe_backend(
         )
 
     runner_backend = moe_config.moe_backend
-    # 'humming' and 'marlin' are quantization-only; an unquantized layer (e.g.
-    # excluded via modules_to_not_convert, or an unquantized MTP draft of a
-    # quantized model) falls through to auto instead of erroring.
-    if runner_backend not in ["auto", "humming", "marlin"]:
+    # Quantization-only backends fall through to auto for excluded layers
+    # and unquantized MTP experts.
+    if runner_backend not in {"auto", "humming", "marlin", *FLASHINFER_MOE_EP_BACKENDS}:
         requested_backend = map_unquantized_backend(runner_backend)
         if (
             activation_format == mk.FusedMoEActivationFormat.BatchedExperts
