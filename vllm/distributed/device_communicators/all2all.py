@@ -38,20 +38,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class PassThroughAll2AllManager(All2AllManagerBase):
-    """Placeholder for ``all2all_backend="passthrough"``.
-
-    The MoE backend dispatches and combines itself, so there is no all2all to
-    manage.
-    """
-
-    def get_handle(self, kwargs):
-        raise RuntimeError(
-            "passthrough has no all2all handle: dispatch and combine run "
-            "inside the MoE backend."
-        )
-
-
 class AgRsAll2AllManager(All2AllManagerBase):
     """An implementation of all2all communication based on
     all-gather (dispatch) and reduce-scatter (combine).
@@ -198,6 +184,16 @@ class AgRsAll2AllManager(All2AllManagerBase):
 
     def destroy(self):
         pass
+
+
+class PassThroughAll2AllManager(AgRsAll2AllManager):
+    """MegaMoE owns communication; BF16 excluded layers retain AG/RS fallback."""
+
+    def get_handle(self, kwargs):
+        raise RuntimeError(
+            "passthrough has no all2all handle: dispatch and combine run "
+            "inside the MoE backend."
+        )
 
 
 class DeepEPAll2AllManagerBase(All2AllManagerBase):

@@ -27,7 +27,7 @@ vLLM provides multiple communication backends for EP. Use `--all2all-backend` to
 | `deepep_high_throughput` | Multi-node prefill | Grouped GEMM with continuous layout, optimized for prefill | Prefill-dominated workloads, high-throughput scenarios |
 | `deepep_low_latency` | Multi-node decode | CUDA graph support, masked layout, optimized for decode | Decode-dominated workloads, low-latency scenarios |
 | `flashinfer_nvlink_one_sided` | MNNVL systems | FlashInfer's one-sided A2A strategy for multi-node NVLink | High-throughput workloads |
-| `passthrough` | Any | Internal, not accepted on the CLI: bound automatically for MoE backends that dispatch and combine themselves, so no all-to-all runs in the framework | `--moe-backend flashinfer_moe_ep_*` (FlashInfer MoE-EP megakernels) |
+| `passthrough` | Any | Internal, not accepted on the CLI: bound automatically for MoE backends that dispatch and combine themselves; excluded unquantized layers retain framework collectives | `--moe-backend flashinfer_moe_ep_*` (FlashInfer MoE-EP megakernels) |
 | `flashinfer_nvlink_two_sided` | MNNVL systems | FlashInfer's two-sided A2A strategy for multi-node NVLink | Systems with NVLink across nodes |
 
 ## Single Node Deployment
@@ -78,6 +78,25 @@ vllm serve deepseek-ai/DeepSeek-V3-0324 \
     --tensor-parallel-size 1 \       # Tensor parallelism across 1 GPU
     --data-parallel-size 8 \         # Data parallelism across 8 processes
     --enable-expert-parallel         # Enable expert parallelism
+```
+
+### Hopper NVFP4 MegaMoE
+
+On H20/H200 with four or eight NVLink-connected GPUs, ModelOpt NVFP4 checkpoints
+with a SwiGLU clamp (`swiglu_limit`) can run FlashInfer's SM90 MegaMoE (NVFP4
+weights, FP8 activations) with `--moe-backend flashinfer_moe_ep_cutedsl`. It needs
+a FlashInfer build that provides [`flashinfer.megamoe`](https://github.com/flashinfer-ai/flashinfer/tree/main/flashinfer/megamoe) and does not support EPLB,
+microbatching/dual batch overlap or runtime weight transfer. Unquantized MoE layers, such as
+BF16 MTP experts, keep the default backend.
+Gate/up must share each expert's global weight scale; local scales must remain
+exactly representable during weight preparation.
+This backend is opt-in: `auto` keeps its existing selection, and unsupported
+explicit configurations fail at startup.
+
+```bash
+vllm serve nvidia/GLM-5.3-Flash-NVFP4 \
+    --data-parallel-size 8 --enable-expert-parallel \
+    --moe-backend flashinfer_moe_ep_cutedsl
 ```
 
 ## Multi-Node Deployment

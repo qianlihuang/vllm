@@ -197,6 +197,15 @@ def maybe_make_prepare_finalize(
     input_dtype: torch.dtype | None = None,
 ) -> FusedMoEPrepareAndFinalize | None:
     if moe.moe_parallel_config.use_passthrough_all2all:
+        if quant_config is not None and quant_config.quant_dtype is None:
+            # Excluded/BF16 MTP experts still need the framework's collectives.
+            if not moe.moe_parallel_config.use_all2all_kernels and moe.dp_size == 1:
+                return make_moe_prepare_and_finalize_no_dp_ep(use_monolithic)
+            return make_moe_prepare_and_finalize_naive_dp_ep(
+                is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,
+                num_dispatchers=moe.moe_parallel_config.ep_size,
+                use_monolithic=use_monolithic,
+            )
         # The experts dispatch and combine themselves, in every EP topology.
         return PassThroughPrepareAndFinalize()
 

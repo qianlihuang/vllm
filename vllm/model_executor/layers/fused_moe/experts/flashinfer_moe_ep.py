@@ -28,6 +28,9 @@ from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep import (
     supports_current_device,
     validate_flashinfer_moe_ep_layer,
 )
+from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep_sm90_nvfp4 import (
+    FlashInferSm90Nvfp4MoeEp,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -37,6 +40,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
     require_finite_positive_scales,
 )
+from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
     pass
@@ -60,7 +64,7 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
         quant_config: FusedMoEQuantConfig,
     ) -> None:
         super().__init__(moe_config, quant_config)
-        self._adapter: FlashInferMoeEp | None = None
+        self._adapter: FlashInferMoeEp | FlashInferSm90Nvfp4MoeEp | None = None
 
     @staticmethod
     def is_supported_config(
@@ -140,7 +144,13 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
         epilogue alphas.
         """
         validate_flashinfer_moe_ep_layer(layer)  # type: ignore[arg-type]
-        adapter = FlashInferMoeEp(
+        adapter_cls = (
+            FlashInferSm90Nvfp4MoeEp
+            if current_platform.is_device_capability(90)
+            and self.quant_config.use_nvfp4_w4a4
+            else FlashInferMoeEp
+        )
+        adapter = adapter_cls(
             self.moe_config,
             FlashInferMoeEpWeights(
                 w13=layer.w13_weight,

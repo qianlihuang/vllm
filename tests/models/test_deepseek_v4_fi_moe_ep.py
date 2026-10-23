@@ -66,6 +66,91 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a Hopper GPU")
+def test_sm90_nvfp4_supports_the_glm_geometry():
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_device_capability(90):
+        pytest.skip("Requires a Hopper GPU")
+    moe = make_dummy_moe_config(
+        num_experts=288,
+        num_local_experts=36,
+        experts_per_token=8,
+        hidden_dim=4096,
+        intermediate_size=2048,
+    )
+    moe.moe_backend = FLASHINFER_MOE_EP_CUTEDSL
+    moe.swiglu_limit = 10.0
+    moe.moe_parallel_config = replace(
+        moe.moe_parallel_config,
+        use_ep=True,
+        ep_size=8,
+        dp_size=8,
+        all2all_backend=PASSTHROUGH_ALL2ALL_BACKEND,
+    )
+    cfg = VllmConfig()
+    with set_current_vllm_config(cfg):
+        if torch.cuda.get_device_properties().multi_processor_count not in (78, 132):
+            assert not _is_supported(moe, kNvfp4Static, kNvfp4Dynamic)[0]
+            return
+        assert _is_supported(moe, kNvfp4Static, kNvfp4Dynamic) == (True, "")
+        cfg.parallel_config.ubatch_size = 2
+        assert not cfg.parallel_config.enable_dbo
+        assert not _is_supported(moe, kNvfp4Static, kNvfp4Dynamic)[0]
+        cfg.parallel_config.ubatch_size = 1
+        assert not _is_supported(moe, kMxfp4Static, None)[0]
+        moe.moe_parallel_config.ep_size = 2
+        assert not _is_supported(moe, kNvfp4Static, kNvfp4Dynamic)[0]
+        moe.moe_parallel_config.ep_size = 8
+        moe.hidden_dim = 4352
+        assert not _is_supported(moe, kNvfp4Static, kNvfp4Dynamic)[0]
+
+
+def test_sm90_nvfp4_marlin_byte_order():
+    from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep_sm90_nvfp4 import (
+        nvfp4_to_marlin,
+    )
+
+    packed = torch.tensor(
+        [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE], dtype=torch.uint8
+    ).view(1, 1, 8)
+    expected = torch.tensor(
+        [0x04, 0x15, 0x26, 0x37, 0x8C, 0x9D, 0xAE, 0xBF], dtype=torch.uint8
+    ).view(1, 1, 8)
+    assert torch.equal(nvfp4_to_marlin(packed), expected)
+
+
+@pytest.mark.parametrize("as_bytes", [False, True])
+def test_sm90_nvfp4_scale_rebalance_preserves_dequantization(as_bytes):
+    from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep_sm90_nvfp4 import (
+        rebalance_nvfp4_scales,
+    )
+
+    scales = torch.tensor([0.5, 32, 224, 448], dtype=torch.float8_e4m3fn)
+    scales = scales.view(1, 2, 2).repeat(2, 1, 1)
+    global_scales = torch.tensor([0.5, 2.0])
+    encoded, adjusted = rebalance_nvfp4_scales(
+        scales.view(torch.uint8) if as_bytes else scales, global_scales
+    )
+    assert encoded.dtype == torch.uint8
+    assert encoded.view(torch.float8_e4m3fn).float().amax() <= 448 / 6
+    assert torch.equal(
+        encoded.view(torch.float8_e4m3fn).float() * adjusted[:, None, None],
+        scales.float() * global_scales[:, None, None],
+    )
+
+
+def test_sm90_nvfp4_rejects_lossy_scale_rebalance():
+    from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep_sm90_nvfp4 import (
+        rebalance_nvfp4_scales,
+    )
+
+    scales = torch.tensor([2**-9, 448], dtype=torch.float8_e4m3fn).view(1, 1, 2)
+    with pytest.raises(ValueError, match="exactly"):
+        rebalance_nvfp4_scales(scales, torch.ones(1))
+
+
 def test_flashinfer_backends_are_megakernels_outside_the_native_model_path():
     assert FLASHINFER_MOE_EP_BACKENDS <= MEGA_MOE_BACKENDS
     assert FLASHINFER_MOE_EP_BACKENDS.isdisjoint(NATIVE_MEGA_MOE_BACKENDS)
@@ -169,15 +254,17 @@ def _is_supported(moe, weight_key, activation_key) -> tuple[bool, str]:
 
 
 @pytest.fixture
-def megakernel_host(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    """A vLLM config without DBO/EPLB/weight transfer, on a supported device."""
-    config = SimpleNamespace(
-        weight_transfer_config=None,
-        parallel_config=SimpleNamespace(enable_dbo=False, enable_eplb=False),
-    )
+def megakernel_host(monkeypatch: pytest.MonkeyPatch):
+    """A Blackwell host without DBO/EPLB/weight transfer."""
+    from vllm.config import VllmConfig
+    from vllm.platforms.interface import DeviceCapability
+
+    config = VllmConfig()
     monkeypatch.setattr(fi_ep, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(
-        FlashInferMoeEpExperts, "_supports_current_device", staticmethod(lambda: True)
+        fi_ep.current_platform,
+        "get_device_capability",
+        lambda *args, **kwargs: DeviceCapability(10, 0),
     )
     return config
 
@@ -345,6 +432,39 @@ def test_passthrough_all2all_backend_selects_the_pass_through_stages():
     )
 
     assert isinstance(prepare_finalize, PassThroughPrepareAndFinalize)
+
+
+def test_passthrough_keeps_dispatch_for_unquantized_mtp_experts():
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.naive_dp_ep import (
+        MoEPrepareAndFinalizeNaiveDPEPModular,
+    )
+
+    moe = make_dummy_moe_config()
+    moe.moe_parallel_config = replace(
+        moe.moe_parallel_config,
+        use_ep=True,
+        ep_size=8,
+        dp_size=8,
+        all2all_backend=PASSTHROUGH_ALL2ALL_BACKEND,
+    )
+    stages = maybe_make_prepare_finalize(moe, FusedMoEQuantConfig.make())
+    assert isinstance(stages, MoEPrepareAndFinalizeNaiveDPEPModular)
+
+
+def test_passthrough_tp_only_bf16_does_not_dispatch_across_dp():
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+        MoEPrepareAndFinalizeNoDPEPModular,
+    )
+
+    moe = make_dummy_moe_config()
+    moe.moe_parallel_config = replace(
+        moe.moe_parallel_config,
+        use_ep=True,
+        ep_size=4,
+        all2all_backend=PASSTHROUGH_ALL2ALL_BACKEND,
+    )
+    stages = maybe_make_prepare_finalize(moe, FusedMoEQuantConfig.make())
+    assert isinstance(stages, MoEPrepareAndFinalizeNoDPEPModular)
 
 
 def test_passthrough_all2all_backend_is_not_a_cli_choice():

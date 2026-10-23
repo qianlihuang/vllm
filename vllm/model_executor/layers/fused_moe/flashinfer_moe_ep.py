@@ -37,7 +37,7 @@ _WEIGHT_FORMATS: dict[QuantKey | None, FlashInferMoeEpWeightFormat] = {
     kMxfp4Static: "mxfp4",
 }
 
-_SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+_SUPPORTED_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3)})
 
 
 def supports_current_device() -> bool:
@@ -155,10 +155,32 @@ def flashinfer_moe_ep_unsupported_reasons(
     vllm_config = get_current_vllm_config()
     if vllm_config.weight_transfer_config is not None:
         unsupported.append("runtime weight transfer")
-    if vllm_config.parallel_config.enable_dbo:
-        unsupported.append("dual batch overlap")
+    if vllm_config.parallel_config.use_ubatching:
+        unsupported.append("microbatching/dual batch overlap")
     if spec.kernel == "deep_gemm" and vllm_config.parallel_config.enable_eplb:
         unsupported.append("EPLB")
+    is_sm90 = current_platform.get_device_capability() == (9, 0)
+    if is_sm90 and weight_key == kMxfp4Static:
+        unsupported.append("SM90 MXFP4 weights")
+    if is_sm90 and weight_key == kNvfp4Static:
+        if torch.cuda.get_device_properties().multi_processor_count not in (78, 132):
+            unsupported.append("SM90 NVFP4 requires 78 or 132 SMs")
+        if spec.kernel != "cutedsl":
+            unsupported.append("SM90 requires NVFP4 CuTeDSL")
+        if moe.moe_parallel_config.ep_size not in (4, 8):
+            unsupported.append("SM90 NVFP4 requires EP4 or EP8")
+        if moe.swiglu_limit is None:
+            unsupported.append("SM90 NVFP4 requires swiglu_limit")
+        if (
+            moe.hidden_dim % (512 if moe.hidden_dim > 4096 else 256)
+            or moe.intermediate_size_per_partition % 128
+            or 2 * moe.intermediate_size_per_partition > moe.hidden_dim
+        ):
+            unsupported.append("SM90 NVFP4 expert dimensions")
+        if vllm_config.parallel_config.enable_eplb:
+            unsupported.append("SM90 NVFP4 EPLB")
+        if moe.routing_method is RoutingMethodType.DeepseekV4:
+            unsupported.append("SM90 NVFP4 input router-weight placement")
     return tuple(unsupported)
 
 
