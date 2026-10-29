@@ -318,6 +318,8 @@ steps:
     - vllm/v1/
     - tests/v1
     - tests/watermarking
+    - tests/entrypoints/mooncake_store_handoff
+    - examples/disaggregated/mooncake_store_handoff
     - examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py
   device: cpu-small
   commands:
@@ -333,6 +335,7 @@ steps:
     - pytest -v -s -m 'cpu_test' v1/ec_connector/unit
     - pytest -v -s -m 'cpu_test' v1/metrics
     - pytest -v -s watermarking
+    - pytest -v -s -m 'cpu_test' entrypoints/mooncake_store_handoff
 
 - label: ":nvidia: (H200 MIG 18GB) Extract Hidden States Integration"
   key: extract-hidden-states-integration
