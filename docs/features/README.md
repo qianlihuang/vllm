@@ -3,6 +3,7 @@
 ## KV Cache Offloading
 
 - [UMBPStoreConnector](umbp_store_connector_usage.md)
+- [Experimental decode handoff through Mooncake](decode_store_handoff.md)
 
 ## Compatibility Matrix
 
