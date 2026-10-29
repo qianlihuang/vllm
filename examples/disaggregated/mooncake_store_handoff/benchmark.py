@@ -31,7 +31,7 @@ async def post(session, url, **kwargs):
         text = await response.text()
         if response.status != 200:
             raise RuntimeError(f"{url}: HTTP {response.status}: {text[:400]}")
-        return json.loads(text)
+        return json.loads(text) if text else None
 
 
 async def metrics(session, base):
@@ -85,6 +85,63 @@ def store_evidence(before, after, targets):
             for status in ("error", "partial_failure")
         ),
     }
+
+
+def nixl_evidence(before, after, source, targets):
+    def delta(name, bases):
+        return sum(counter(after[b], name) - counter(before[b], name) for b in bases)
+
+    return {
+        "transfers": delta("vllm:nixl_bytes_transferred_count", targets),
+        "bytes": delta("vllm:nixl_bytes_transferred_sum", targets),
+        "errors": {
+            name: delta("vllm:nixl_" + name + "_total", [source, *targets])
+            for name in (
+                "num_failed_transfers",
+                "num_failed_notifications",
+                "num_kv_expired_reqs",
+                "num_notifications_after_expiry",
+            )
+        },
+    }
+
+
+def validate_migration(handoffs, requests, decode_kv_hits, evidence, nixl):
+    assert all(
+        h.get("source_kv_params") and not h.get("migrated_without_kv") for h in handoffs
+    ), "P2P run did not export every request"
+    assert nixl["transfers"] >= requests and nixl["bytes"] > 0, (
+        "No complete NIXL read evidence"
+    )
+    assert all(value == 0 for value in nixl["errors"].values()), (
+        "NIXL failure or expired migration lease"
+    )
+    assert all(
+        evidence[name] == 0
+        for name in (
+            "load_ok",
+            "load_keys",
+            "load_bytes",
+            "load_failed_keys",
+            "load_errors",
+            "local_hit_tokens",
+        )
+    ), "P2P run used another cache path"
+    assert decode_kv_hits == requests, "P2P did not restore decode KV"
+
+
+async def wait_progress(records, counts, tasks):
+    async with asyncio.timeout(30):
+        while not all(
+            len(record["tokens"]) >= count for record, count in zip(records, counts)
+        ):
+            for task in tasks:
+                if task.done():
+                    await task
+                    raise RuntimeError(
+                        "Background request ended inside the profile window"
+                    )
+            await asyncio.sleep(0.01)
 
 
 async def stream(session, base, payload, record):
@@ -172,6 +229,7 @@ async def run(args):
                 params={"reset_connector": "false"},
             )
         before_stats = await (await session.get(args.proxy + "/stats")).json()
+        assert before_stats.get("mode") == args.mode, "Benchmark/proxy mode mismatch"
         offset = len(before_stats["requests"])
         before = {
             base: await metrics(session, base) for base in [args.source, *args.targets]
@@ -200,6 +258,11 @@ async def run(args):
             for i, (prompt, record) in enumerate(zip(prompts, records))
         ]
         background, bg_tasks = [], []
+        profile = {
+            "enabled": args.profile_targets,
+            "prefix": f"{args.mode}_{nonce[:12]}",
+        }
+        profiling = []
         try:
             await wait_tokens(records, max(1, args.handoff_tokens - 512), tasks)
             for i in range(args.background):
@@ -253,6 +316,23 @@ async def run(args):
                 base: await metrics(session, base)
                 for base in [args.source, *args.targets]
             }
+            if args.profile_targets:
+                if not background:
+                    raise ValueError("Target-step profiling needs background decodes")
+                profile["targets"] = {}
+                for i, base in enumerate(args.targets):
+                    prefix = f"{profile['prefix']}_target{i}"
+                    profiling.append(base)
+                    await post(
+                        session,
+                        base + "/start_profile",
+                        json={"profile_prefix": prefix},
+                    )
+                    profile["targets"][base] = prefix
+                profile["started"] = time.perf_counter()
+                await wait_progress(
+                    background, [len(r["tokens"]) + 40 for r in background], bg_tasks
+                )
             handoff_at = time.perf_counter()
             retirement = (
                 None
@@ -260,8 +340,42 @@ async def run(args):
                 else await post(session, args.proxy + "/retire", json={})
             )
             retired_at = time.perf_counter()
+            if profiling:
+                if not args.control:
+                    async with asyncio.timeout(30):
+                        while True:
+                            live = await (
+                                await session.get(args.proxy + "/stats")
+                            ).json()
+                            handoff_records = live["requests"][offset:]
+                            if len(handoff_records) == args.requests and all(
+                                "target_ttft_ms" in h for h in handoff_records
+                            ):
+                                break
+                            if any(
+                                h["phase"] in ("failed", "cancelled")
+                                for h in handoff_records
+                            ):
+                                raise RuntimeError(
+                                    "Handoff failed inside the profile window"
+                                )
+                            await asyncio.sleep(0.01)
+                await wait_progress(
+                    background, [len(r["tokens"]) + 40 for r in background], bg_tasks
+                )
+                profile["stop_started"] = time.perf_counter()
+                await asyncio.gather(
+                    *(post(session, base + "/stop_profile") for base in profiling)
+                )
+                profiling.clear()
+                profile["stopped"] = time.perf_counter()
             await asyncio.gather(*tasks, *bg_tasks)
         finally:
+            if profiling:
+                await asyncio.gather(
+                    *(post(session, base + "/stop_profile") for base in profiling),
+                    return_exceptions=True,
+                )
             for task in tasks + bg_tasks:
                 if not task.done():
                     task.cancel()
@@ -281,6 +395,7 @@ async def run(args):
         }
         cached = sum(h.get("target_cached_tokens") or 0 for h in handoffs)
         evidence = store_evidence(before_handoff, after, args.targets)
+        nixl = nixl_evidence(before_handoff, after, args.source, args.targets)
         snapshot = {
             "partial": True,
             "config": vars(args) | {"out": str(args.out)},
@@ -297,12 +412,19 @@ async def run(args):
         args.out.write_text(json.dumps(snapshot, indent=2))
         if not args.control:
             async with asyncio.timeout(30):
-                while evidence["external_tokens"] < cached or evidence["load_ok"] == 0:
+                while evidence["external_tokens"] < cached or (
+                    evidence["load_ok"] == 0
+                    if args.mode == "store"
+                    else nixl["transfers"] < args.requests
+                ):
                     after = {
                         base: await metrics(session, base)
                         for base in [args.source, *args.targets]
                     }
                     evidence = store_evidence(before_handoff, after, args.targets)
+                    nixl = nixl_evidence(
+                        before_handoff, after, args.source, args.targets
+                    )
                     await asyncio.sleep(0.1)
         snapshot.update(metrics_after=after, store_evidence=evidence)
         args.out.write_text(json.dumps(snapshot, indent=2))
@@ -351,10 +473,11 @@ async def run(args):
             if h.get("target_cached_tokens") is not None
         ]
         result = {
-            "partial": False,
+            "partial": True,
             "config": vars(args) | {"out": str(args.out)},
             "retirement": retirement,
             "pause_ms": 1000 * (retired_at - handoff_at),
+            "profile": profile,
             "summary": {
                 "requests": len(records),
                 "handoffs": sum(h.get("source_tokens", 0) > 0 for h in handoffs),
@@ -366,6 +489,7 @@ async def run(args):
                     for h in handoffs
                 ),
                 "store_evidence": evidence,
+                "nixl_evidence": nixl,
                 "uncached_suffix_tokens": uncached_suffix,
                 "cold_next_token_matches": sum(
                     c["actual"] == c["reference"] for c in cold_checks
@@ -424,12 +548,12 @@ async def run(args):
         }
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(result, indent=2))
-        print(json.dumps(result["summary"], indent=2), flush=True)
         assert len(handoffs) == args.requests, "Unexpected proxy request count"
         if not args.control:
             assert result["summary"]["handoffs"] == args.requests, (
                 "Some requests did not migrate in flight"
             )
+        if not args.control and args.mode == "store":
             assert result["summary"]["store_hits"] == args.requests, (
                 "Cache miss: inspect before claiming full store coverage"
             )
@@ -445,6 +569,14 @@ async def run(args):
                 and evidence["load_failed_keys"] == 0
                 and evidence["load_errors"] == 0
             ), "Mooncake loads failed or were not observed"
+        if not args.control and args.mode == "migrate":
+            validate_migration(
+                handoffs,
+                args.requests,
+                result["summary"]["decode_kv_hits"],
+                evidence,
+                nixl,
+            )
         assert all(len(r["tokens"]) == args.max_tokens for r in records)
         await post(session, args.proxy + "/resume", json={})
         for target in args.targets:
@@ -454,6 +586,9 @@ async def run(args):
                 params={"mode": "wait", "clear_cache": "false"},
             )
             await post(session, target + "/resume")
+        result.update(partial=False, validation="passed")
+        args.out.write_text(json.dumps(result, indent=2))
+        print(json.dumps(result["summary"], indent=2), flush=True)
 
 
 def main():
@@ -463,7 +598,18 @@ def main():
     parser.add_argument("--source", required=True)
     parser.add_argument("--targets", nargs="+", required=True)
     parser.add_argument("--model", default="dsv41")
+    parser.add_argument(
+        "--mode",
+        choices=("store", "migrate"),
+        default="store",
+        help="Must match the proxy; migrate skips the store-coverage asserts",
+    )
     parser.add_argument("--skip-cold-reference", action="store_true")
+    parser.add_argument(
+        "--profile-targets",
+        action="store_true",
+        help="Capture target step traces in a separate diagnostic trial",
+    )
     parser.add_argument(
         "--control",
         action="store_true",

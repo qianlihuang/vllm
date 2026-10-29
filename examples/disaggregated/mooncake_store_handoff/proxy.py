@@ -14,14 +14,18 @@ from aiohttp import web
 
 
 class StoreHandoffProxy:
-    def __init__(self, source, targets, prefill=None):
+    def __init__(self, source, targets, prefill=None, mode="store"):
         if not targets:
             raise ValueError("At least one target decode URL is required")
+        if mode not in ("store", "migrate"):
+            raise ValueError(f"Unknown handoff mode: {mode}")
         self.source = source.rstrip("/")
         self.targets = itertools.cycle(t.rstrip("/") for t in targets)
         self.prefill = prefill.rstrip("/") if prefill else None
+        self.mode = mode
         self.session = None
         self.retirement = None
+        self.retire_received = None
         self.admission = asyncio.Lock()
         self.records = []
         self.pauses = []
@@ -122,12 +126,18 @@ class StoreHandoffProxy:
                             record["target_cached_tokens"] = usage.get(
                                 "prompt_tokens_details", {}
                             ).get("cached_tokens")
+                    if not resumed and chunk.get("kv_transfer_params"):
+                        record["source_kv_params"] = chunk["kv_transfer_params"]
                     for choice in choices:
                         new_tokens = choice.get("token_ids") or []
                         if new_tokens:
                             now = time.perf_counter()
                             if resumed and "target_ttft_ms" not in record:
                                 record["target_ttft_ms"] = 1000 * (now - started)
+                                if self.retire_received is not None:
+                                    record["retire_to_first_token_ms"] = 1000 * (
+                                        now - self.retire_received
+                                    )
                                 last = record.get(
                                     "source_last_token_at", record["handoff_at"]
                                 )
@@ -179,7 +189,10 @@ class StoreHandoffProxy:
                     source_tokens=len(tokens),
                     handoff_at=time.perf_counter(),
                 )
-                await asyncio.shield(self.retirement)
+                if self.mode == "migrate":
+                    record["phase"] = "dispatching"
+                else:
+                    await asyncio.shield(self.retirement)
                 base = next(self.targets)
                 context = prompt + tokens
                 record.update(
@@ -191,6 +204,14 @@ class StoreHandoffProxy:
                     sampling_params=dict(params, max_tokens=budget - len(tokens)),
                 )
                 outgoing.pop("kv_transfer_params", None)
+                if self.mode == "migrate":
+                    resumed_from_source = record.get("source_kv_params")
+                    if resumed_from_source is None:
+                        record["migrated_without_kv"] = True
+                        raise RuntimeError(
+                            "Migrate response has no exported KV parameters"
+                        )
+                    outgoing["kv_transfer_params"] = resumed_from_source
                 await attempt(base, outgoing, resumed=True)
             record.update(
                 phase="complete", completion_tokens=len(tokens), finish_reason=finish
@@ -236,13 +257,15 @@ class StoreHandoffProxy:
 
     async def drain(self):
         started = time.perf_counter()
+        mode = "migrate" if self.mode == "migrate" else "abort"
         result = await self.post(
-            self.source, "/pause", params={"mode": "abort", "clear_cache": "false"}
+            self.source, "/pause", params={"mode": mode, "clear_cache": "false"}
         )
         self.pauses.append({"seconds": time.perf_counter() - started, "status": result})
         return result
 
     async def retire(self, request):
+        self.retire_received = time.perf_counter()
         async with self.admission:
             if self.retirement is None:
                 self.retirement = asyncio.create_task(self.drain())
@@ -269,14 +292,16 @@ class StoreHandoffProxy:
         return web.json_response({"status": "resumed"})
 
     async def stats(self, request):
-        return web.json_response({"requests": self.records, "pauses": self.pauses})
+        return web.json_response(
+            {"mode": self.mode, "requests": self.records, "pauses": self.pauses}
+        )
 
 
 PROXY_KEY = web.AppKey("store_handoff_proxy", StoreHandoffProxy)
 
 
-def create_app(source, targets, prefill=None):
-    proxy = StoreHandoffProxy(source, targets, prefill)
+def create_app(source, targets, prefill=None, mode="store"):
+    proxy = StoreHandoffProxy(source, targets, prefill, mode)
     app = web.Application(handler_args={"handler_cancellation": True})
     app[PROXY_KEY] = proxy
     app.cleanup_ctx.append(proxy.lifecycle)
@@ -292,11 +317,21 @@ def main():
     parser.add_argument("--source", required=True)
     parser.add_argument("--targets", nargs="+", required=True)
     parser.add_argument("--prefill")
+    parser.add_argument(
+        "--mode",
+        choices=("store", "migrate"),
+        default="store",
+        help=(
+            "store: wait for the source drain and reload the saved prefix; "
+            "migrate: forward the source's kv_transfer_params as soon as the "
+            "aborted response arrives"
+        ),
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8400)
     parser.add_argument("--stats-file", type=Path)
     args = parser.parse_args()
-    app = create_app(args.source, args.targets, args.prefill)
+    app = create_app(args.source, args.targets, args.prefill, args.mode)
     if args.stats_file:
 
         async def save_stats(app):

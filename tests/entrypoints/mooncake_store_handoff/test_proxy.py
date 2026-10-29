@@ -15,11 +15,32 @@ from aiohttp.test_utils import TestServer
 pytestmark = [pytest.mark.cpu_test, pytest.mark.asyncio]
 
 
-def proxy_app(source, target, prefill=None):
+def proxy_app(source, target, prefill=None, mode="store"):
     module = importlib.import_module(
         "examples.disaggregated.mooncake_store_handoff.proxy"
     )
-    return module.create_app(source, [target], prefill=prefill)
+    return module.create_app(source, [target], prefill=prefill, mode=mode)
+
+
+@pytest.mark.parametrize("status", ["ok", "partial_failure", "error"])
+async def test_p2p_evidence_rejects_store_reads_including_failed_loads(status):
+    benchmark = importlib.import_module(
+        "examples.disaggregated.mooncake_store_handoff.benchmark"
+    )
+    target = "http://target"
+    evidence = benchmark.store_evidence(
+        {target: ""},
+        {
+            target: 'vllm:mooncake_store_operation_total{operation="load_get",'
+            f'status="{status}"}} 1\n'
+        },
+        [target],
+    )
+    nixl = {"transfers": 1, "bytes": 1024, "errors": {"num_failed_transfers": 0}}
+    with pytest.raises(AssertionError, match="another cache path"):
+        benchmark.validate_migration(
+            [{"source_kv_params": {"remote": "kv"}}], 1, 1, evidence, nixl
+        )
 
 
 async def emit(
@@ -201,6 +222,100 @@ async def test_handoff_waits_for_store_drain_and_resumes_without_prefill(streami
             assert resumed["sampling_params"]["max_tokens"] == 3
             assert "kv_transfer_params" not in resumed
             assert resumed["sampling_params"]["extra_args"] == {"keep": 1}
+
+
+@pytest.mark.parametrize("export_kv", [True, False])
+async def test_migrate_requires_source_params_without_waiting_for_drain(export_kv):
+    """The migrate arm continues as soon as the aborted response arrives,
+    carrying the source's transfer params; it must not block on the pause."""
+    started, aborted, pause_started, release = [asyncio.Event() for _ in range(4)]
+    seen: dict[str, list[dict[str, Any]]] = {"source": [], "target": [], "pause": []}
+    params = {"remote_engine_id": "src", "remote_num_tokens": 7}
+
+    async def source(request):
+        seen["source"].append(await request.json())
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await emit(response, [10, 11])
+        started.set()
+        await aborted.wait()
+        payload = {
+            "choices": [{"token_ids": [], "text": "", "finish_reason": "abort"}],
+        }
+        if export_kv and seen["pause"][-1]["mode"] == "migrate":
+            payload["kv_transfer_params"] = params
+        await response.write(f"data: {json.dumps(payload)}\n\n".encode())
+        await response.write_eof()
+        return response
+
+    async def pause(request):
+        seen["pause"].append(dict(request.query))
+        aborted.set()
+        pause_started.set()
+        await release.wait()
+        return web.json_response({"status": "paused"})
+
+    async def target(request):
+        seen["target"].append(await request.json())
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await emit(response, [12, 13, 14], "length")
+        await response.write_eof()
+        return response
+
+    backend = web.Application()
+    backend.router.add_post("/inference/v1/generate", source)
+    backend.router.add_post("/pause", pause)
+    d_app = web.Application()
+    d_app.router.add_post("/inference/v1/generate", target)
+    async with TestServer(backend) as src, TestServer(d_app) as d:
+        app = proxy_app(
+            str(src.make_url("")).rstrip("/"),
+            str(d.make_url("")).rstrip("/"),
+            mode="migrate",
+        )
+        async with TestServer(app) as proxy, aiohttp.ClientSession() as client:
+            base = str(proxy.make_url("")).rstrip("/")
+            body = {
+                "model": "test",
+                "token_ids": [1, 2, 3],
+                "sampling_params": {"max_tokens": 5},
+                "stream": True,
+            }
+            generation = asyncio.create_task(
+                collect(client, base + "/inference/v1/generate", body)
+            )
+            retirement = None
+            try:
+                await asyncio.wait_for(started.wait(), 5)
+                retirement = asyncio.create_task(collect(client, base + "/retire", {}))
+                await asyncio.wait_for(pause_started.wait(), 5)
+                status, result = await asyncio.wait_for(generation, 5)
+                assert not release.is_set()
+                if export_kv:
+                    assert seen["target"], "continuation must not wait for the drain"
+                else:
+                    assert seen["target"] == []
+                    assert result["errors"]
+                    await wait_phase(client, base, "failed")
+            finally:
+                release.set()
+                aborted.set()
+                for task in (generation, retirement):
+                    if task is not None and not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *(t for t in (generation, retirement) if t), return_exceptions=True
+                )
+            assert status == 200
+            assert seen["pause"] == [{"mode": "migrate", "clear_cache": "false"}]
+            if not export_kv:
+                return
+            assert result["choices"][0]["token_ids"] == [10, 11, 12, 13, 14]
+            resumed = seen["target"][0]
+            assert resumed["token_ids"] == [1, 2, 3, 10, 11]
+            assert resumed["sampling_params"]["max_tokens"] == 3
+            assert resumed["kv_transfer_params"] == params
 
 
 @pytest.mark.parametrize("finish", ["stop", "length", "abort"])

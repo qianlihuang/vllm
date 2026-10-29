@@ -100,6 +100,32 @@ After each handoff run, a separately salted cold recompute checks the first
 continuation token. Exact agreement is reported, not assumed: vLLM kernels
 are not batch invariant. Cold checks run outside the measured handoff window.
 
+## NIXL comparison and affected decode steps
+
+`--mode migrate` on both proxy and benchmark selects the comparator for
+[PR #63702](https://github.com/vllm-project/vllm/pull/63702). The source is paused
+with `mode=migrate`, and exported transfer parameters are immediately forwarded
+to targets so NIXL leases can finish while the pause drains. Missing parameters,
+NIXL errors or expired leases fail the comparison. Successful and failed Mooncake
+load attempts and local cache hits must all be zero. Use a source with decode
+saving disabled for this arm. The PR and the streaming metadata patch in the
+experiment's reproduction bundle are required for this comparator.
+
+To capture the affected steps, enable native torch profiling on the targets:
+
+```bash
+--profiler-config '{"profiler":"torch","torch_profiler_dir":"/shared/traces","torch_profiler_with_stack":false,"torch_profiler_record_shapes":false,"torch_profiler_dump_cuda_time_total":false,"ignore_frontend":true,"detailed_trace_annotation":true}'
+```
+
+Then add `--profile-targets --skip-cold-reference` to a separate benchmark run.
+It captures background decode before retirement through admission and a short
+decode period afterwards. Ordinary repeated latency runs leave profiling idle.
+The analyzer under `benchmarks/experiments/decode_store_handoff` groups matching
+CPU/GPU annotations and includes EP peers in each admission window. It reports
+worker start-to-start periods and main-forward GPU spans separately. Profiler
+overhead affects these diagnostic measurements; compare them alongside raw
+background output-chunk gaps from the ordinary runs.
+
 Generated tokens become prompt tokens on the target. Sampler/RNG, penalties
 and structured-output state are not transferred. This example neither adds
 SSM decode-state offload nor promises zero replay or batch-invariant tokens.

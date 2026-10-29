@@ -12,7 +12,10 @@ the original prompt plus generated tokens directly to a target decode instance.
 The target reads the available prefix from the store and computes the suffix.
 
 The example includes a benchmark for cache coverage, remaining replay, the
-output pause and the impact on existing target requests. The store must survive
+output pause and the impact on existing target requests. Separate native torch
+profiler captures identify affected worker steps, including EP peers waiting
+while another rank rebuilds the prefix. Cached-token usage alone excludes
+additional sliding-window replay. The store must survive
 source retirement. Sampler and structured-output state are not transferred;
 linear-attention/SSM decode-state offload is not implemented by this example.
 See the example for configuration, limitations and reproduction commands.
