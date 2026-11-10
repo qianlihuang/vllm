@@ -6,13 +6,16 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
     CacheConfig,
+    CUDAGraphMode,
     VllmConfig,
 )
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -34,7 +37,10 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, next_power_of_2
-from vllm.v1.attention.backends.mla.indexer import Glm5NextIndexerBackend
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadata,
+    Glm5NextIndexerBackend,
+)
 from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
@@ -306,6 +312,69 @@ class Indexer(nn.Module):
         refill_derived(self, "_wp_fp32", wp)
 
     def forward(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> torch.Tensor:
+        if (
+            current_platform.is_cuda()
+            and self.rope_dim == 0
+            and self.indexer_op.dcp_world_size == 1
+            and not torch.compiler.is_compiling()
+        ):
+            return self._forward_with_metadata(hidden_states, qr, positions, rotary_emb)
+        return self._forward(hidden_states, qr, positions, rotary_emb)
+
+    @eager_break_during_capture
+    def _forward_with_metadata(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> torch.Tensor:
+        # Keep the producer and indexer in one eager segment so a captured
+        # short prefill cannot suppress scoring on a subsequent long chunk.
+        context = get_forward_context() if is_forward_context_available() else None
+        attn_metadata = context.attn_metadata if context is not None else None
+        metadata = (
+            attn_metadata.get(self.k_cache.prefix)
+            if isinstance(attn_metadata, dict)
+            else None
+        )
+        if (
+            context is not None
+            and context.cudagraph_runtime_mode != CUDAGraphMode.FULL
+            and positions is not None
+            and isinstance(metadata, DeepseekV32IndexerMetadata)
+            and metadata.num_decodes == 0
+            and metadata.num_prefills > 0
+            and metadata.prefill is not None
+            and 0 <= metadata.prefill.max_prefill_seq_len <= self.topk_tokens
+        ):
+            # All causal keys are selected. Preserve the K projection, norm,
+            # compression gate and cache writes, including their original dtype.
+            kw, _ = self.wk_weights_proj(hidden_states)
+            k = _fused_indexer_k_norm(
+                kw[:, : self.head_dim],
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.head_dim,
+                self.k_norm.eps,
+            )
+            gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+            heads = max(self.n_head, 32)
+            q_fp8 = hidden_states.new_empty(
+                (0, heads, self.head_dim), dtype=current_platform.fp8_dtype()
+            )
+            weights = hidden_states.new_empty((0, heads), dtype=torch.float32)
+            return self.indexer_op(
+                hidden_states,
+                q_fp8,
+                k,
+                weights,
+                gate_score=gate_score,
+                compress_ape=self.index_kpool_compress_ape,
+                index_kpool=self.index_kpool,
+                positions=positions,
+            )
+        return self._forward(hidden_states, qr, positions, rotary_emb)
+
+    def _forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
