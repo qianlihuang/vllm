@@ -325,7 +325,10 @@ def sparse_attn_indexer_kpool(
         # Under ShardQ the chunks index the shardq_gather_indices tokens.
         prefill_q, prefill_q_scale = q_quant, q_scale
         prefill_weights, prefill_positions = weights, positions
-        if (indices := prefill_metadata.shardq_gather_indices) is not None:
+        if (
+            not short_prefill
+            and (indices := prefill_metadata.shardq_gather_indices) is not None
+        ):
             prefill_q, prefill_weights = q_quant[indices], weights[indices]
             if q_scale is not None:
                 prefill_q_scale = q_scale[indices]
