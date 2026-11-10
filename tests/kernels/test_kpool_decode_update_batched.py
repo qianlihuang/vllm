@@ -668,3 +668,51 @@ def test_batched_matches_reference_fuzz(seed):
     # Random inputs can land the pooled value on a bf16 rounding midpoint,
     # where the kernel and the CPU reference may round apart by one fp8 step.
     _assert_eq(r_ref, r_kern, k_byte_tol=1)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA output buffer")
+@pytest.mark.parametrize("rows", [1, 16])
+@pytest.mark.parametrize("padding_rows", [0, 4])
+@pytest.mark.parametrize("pool_dtype", [torch.int32, torch.uint32])
+def test_expand_fills_wide_output_without_touching_neighbors(
+    rows, padding_rows, pool_dtype
+):
+    from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+        expand_pools_and_append_tail,
+    )
+
+    pool_size, groups = 4, 4
+    result_cols = groups * pool_size + pool_size - 1
+    width = result_cols + 128
+    ids = torch.arange(rows * groups, device="cuda", dtype=torch.int32).view(
+        rows, groups
+    )
+    ids[:, 1] = -1 if pool_dtype == torch.int32 else 0
+    ids = ids.to(pool_dtype)
+    positions = torch.arange(rows, device="cuda", dtype=torch.int64) + 131071
+    out_rows = rows + padding_rows
+    storage = torch.full((out_rows + 2, width + 5), 7, device="cuda", dtype=torch.int32)
+    out = storage[1 : out_rows + 1, :width]
+
+    def check(actual):
+        expected = expand_pools_and_append_tail(ids, positions, pool_size, seq_offset=1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(out[:rows, :result_cols], expected, rtol=0, atol=0)
+        assert (out[:, result_cols:] == -1).all()
+        assert (out[rows:] == -1).all()
+        assert (storage[0] == 7).all() and (storage[-1] == 7).all()
+        assert (storage[:, width:] == 7).all()
+
+    actual = expand_pools_and_append_tail(
+        ids, positions, pool_size, seq_offset=1, out=out
+    )
+    check(actual)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = expand_pools_and_append_tail(
+            ids, positions, pool_size, seq_offset=1, out=out
+        )
+    storage.fill_(7)
+    positions.add_(1)
+    graph.replay()
+    check(captured)
