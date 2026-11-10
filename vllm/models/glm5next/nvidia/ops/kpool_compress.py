@@ -862,10 +862,11 @@ def append_tail_to_topk(
 @triton.jit
 def _expand_pools_and_append_tail_kernel(
     pool_ids_ptr,  # [rows, n_groups], int (any int dtype)
-    seq_lens_ptr,  # [rows], int32 (token-granular seq_len)
-    out_ptr,  # [rows, out_cols], int32
+    seq_lens_ptr,  # [rows], integer token lengths or positions
+    out_ptr,  # [out_rows, out_cols], int32
+    rows,  # live input rows
     topk,  # n_groups * pool_size
-    out_cols,  # topk + pool_size - 1
+    out_cols,  # includes output padding
     POOL_SIZE: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
     SEQ_OFFSET: tl.constexpr,
@@ -879,7 +880,8 @@ def _expand_pools_and_append_tail_kernel(
     cols = tile * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
     mask = cols < out_cols
 
-    seq_len = tl.load(seq_lens_ptr + row) + SEQ_OFFSET
+    seq_len = tl.load(seq_lens_ptr + row, mask=row < rows, other=-SEQ_OFFSET)
+    seq_len += SEQ_OFFSET
     pool_len = seq_len // POOL_SIZE
     tail_start = pool_len * POOL_SIZE
     tail_count = seq_len - tail_start  # in [0, POOL_SIZE)
@@ -888,7 +890,11 @@ def _expand_pools_and_append_tail_kernel(
     is_history = cols < topk
     g = cols // POOL_SIZE
     o = cols % POOL_SIZE
-    pid = tl.load(pool_ids_ptr + row * pid_s0 + g, mask=mask & is_history, other=-1)
+    pid = tl.load(
+        pool_ids_ptr + row * pid_s0 + g,
+        mask=mask & is_history & (row < rows),
+        other=-1,
+    )
     hist_val = (pid * POOL_SIZE + o).to(tl.int32)
     hist_out = tl.where(pid >= 0, hist_val, -1)
 
@@ -899,6 +905,7 @@ def _expand_pools_and_append_tail_kernel(
     tail_out = tl.where(is_tail, tail_val, -1)
 
     result = tl.where(is_history, hist_out, tail_out)
+    result = tl.where(row < rows, result, -1)
     tl.store(out_ptr + row * out_s0 + cols, result, mask=mask)
 
 
@@ -920,23 +927,30 @@ def expand_pools_and_append_tail(
     with one Triton launch.
 
     `seq_lens` may be any integer dtype; `seq_offset` is added to each
-    (positions with `seq_offset=1`). `out` is an int32 `[rows, >= topk +
-    pool_size - 1]` buffer to write into; the result is its leading columns.
+    (positions with `seq_offset=1`). `out` is an int32 `[>= rows, >= topk +
+    pool_size - 1]` buffer to write into. Extra rows and columns are filled
+    with -1; the result retains the input row count and leading columns.
     """
     rows, n_groups = pool_ids.shape
     topk = n_groups * pool_size
-    out_cols = topk + pool_size - 1
+    result_cols = topk + pool_size - 1
     if out is None:
-        out = torch.empty((rows, out_cols), dtype=torch.int32, device=pool_ids.device)
+        out = torch.empty(
+            (rows, result_cols), dtype=torch.int32, device=pool_ids.device
+        )
+        result = out
     else:
-        assert out.dtype == torch.int32 and out.shape[1] >= out_cols
-        out = out[:rows, :out_cols]
+        assert out.dtype == torch.int32 and out.shape[0] >= rows
+        assert out.shape[1] >= result_cols and out.stride(1) == 1
+        result = out[:rows, :result_cols]
+    out_cols = out.shape[1]
     BLOCK_COLS = 128
     n_tiles = triton.cdiv(out_cols, BLOCK_COLS)
-    _expand_pools_and_append_tail_kernel[(rows, n_tiles)](
+    _expand_pools_and_append_tail_kernel[(out.shape[0], n_tiles)](
         pool_ids,
         seq_lens,
         out,
+        rows,
         topk,
         out_cols,
         POOL_SIZE=pool_size,
@@ -945,4 +959,4 @@ def expand_pools_and_append_tail(
         pid_s0=pool_ids.stride(0),
         out_s0=out.stride(0),
     )
-    return out
+    return result

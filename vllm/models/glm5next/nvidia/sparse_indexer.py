@@ -297,11 +297,10 @@ def sparse_attn_indexer_kpool(
     kpool_stage = SPECIALIZED_KPOOL
     if kpool_stage is not None and not kpool_stage.active():
         kpool_stage = None
-    # Uniform kpool decode rows can leave their expansion to the layer's index
-    # remap (the stage's fused kernel), which needs no -1 filled logical rows.
-    defer_topk = (
-        kpool_stage is not None
-        and has_decode
+    # Uniform long decode fills every output row in expand, or leaves the
+    # expansion to the specialized stage's fused index remap.
+    uniform_long_decode = (
+        has_decode
         and not has_prefill
         and index_kpool > 1
         and positions is not None
@@ -309,6 +308,10 @@ def sparse_attn_indexer_kpool(
         and attn_metadata_narrowed.decode is not None
         and not attn_metadata_narrowed.decode.requires_padding
         and attn_metadata_narrowed.max_seq_len > topk_tokens
+    )
+    defer_topk = (
+        kpool_stage is not None
+        and uniform_long_decode
         and kpool_stage.defers(
             k_cache_prefix,
             num_decode_tokens,
@@ -317,7 +320,8 @@ def sparse_attn_indexer_kpool(
             topk_indices_buffer.shape[1],
         )
     )
-    if not defer_topk:
+    fill_topk_in_expand = kpool_stage is None and uniform_long_decode
+    if not defer_topk and not fill_topk_in_expand:
         topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
@@ -761,6 +765,7 @@ def sparse_attn_indexer_kpool(
                 if defer_topk:
                     kpool_stage.defer(pool_topk, positions[:n], index_kpool)
                     return topk_indices_buffer
+                out_rows = hidden_states.shape[0] if fill_topk_in_expand else n
                 (
                     kpool_ops.expand_pools_and_append_tail
                     if kpool_stage is None
@@ -770,7 +775,7 @@ def sparse_attn_indexer_kpool(
                     positions[:n],
                     index_kpool,
                     seq_offset=1,
-                    out=topk_indices_buffer[:n],
+                    out=topk_indices_buffer[:out_rows],
                 )
                 return topk_indices_buffer
             pool_ids = pool_topk
