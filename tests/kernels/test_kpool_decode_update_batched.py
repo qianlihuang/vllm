@@ -668,3 +668,43 @@ def test_batched_matches_reference_fuzz(seed):
     # Random inputs can land the pooled value on a bf16 rounding midpoint,
     # where the kernel and the CPU reference may round apart by one fp8 step.
     _assert_eq(r_ref, r_kern, k_byte_tol=1)
+
+
+@pytest.mark.parametrize("rows", [0, 1, 17, 8192])
+@pytest.mark.parametrize("positions_dtype", [torch.int32, torch.int64])
+def test_causal_indices_fill_preserves_strided_output(rows, positions_dtype):
+    from vllm.models.glm5next.nvidia.ops import kpool_compress
+
+    width = 2176
+    storage = torch.full((rows + 2, width + 7), -99, device="cuda", dtype=torch.int32)
+    output = storage[1 : rows + 1, 3 : width + 3]
+    positions = torch.arange(rows + 1, device="cuda", dtype=positions_dtype)[1:]
+    positions.remainder_(2049).sub_(1)
+    columns = torch.arange(width, device="cuda", dtype=torch.int32)
+    expected = storage.clone()
+    expected[1 : rows + 1, 3 : width + 3] = torch.where(
+        columns[None, :] <= positions.to(torch.int32)[:, None], columns[None, :], -1
+    )
+    kpool_compress.fill_causal_indices(output, positions)
+    assert torch.equal(storage, expected)
+
+
+@pytest.mark.parametrize("pool_size", [4, 16])
+def test_pool_expansion_writes_native_indices_into_strided_output(pool_size):
+    from vllm.models.glm5next.nvidia.ops import kpool_compress
+
+    pool_ids = torch.tensor([[0, 17, -1], [5, 9, 4]], device="cuda", dtype=torch.int32)
+    positions = torch.tensor([8192, 32767], device="cuda", dtype=torch.int64)
+    expected = kpool_compress.expand_pools_and_append_tail(
+        pool_ids.to(torch.int64), positions.to(torch.int32) + 1, pool_size
+    )
+    storage = torch.full(
+        (4, expected.shape[1] + 7), -99, dtype=torch.int32, device="cuda"
+    )
+    reference = storage.clone()
+    reference[1:3, 2 : expected.shape[1] + 2] = expected
+    actual = kpool_compress.expand_pools_and_append_tail(
+        pool_ids, positions, pool_size, seq_offset=1, out=storage[1:3, 2:]
+    )
+    assert actual.data_ptr() == storage[1:3, 2:].data_ptr()
+    assert torch.equal(storage, reference)
