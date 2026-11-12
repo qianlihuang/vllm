@@ -29,7 +29,6 @@ from vllm.models.glm5next.common.sparse_indexer import (
     RADIX_TOPK_WORKSPACE_SIZE,
     _build_decode_scatter_indices,
     _decode_topk_seq_lens,
-    _fill_causal_indices,
     _fill_short_decode_causal_indices,
     _gather_workspace_shapes,
     _scatter_decode_tokens_by_request,
@@ -349,9 +348,9 @@ def sparse_attn_indexer_kpool(
             # short_prefill is only True when positions is not None (above),
             # but narrow explicitly for the indexer below.
             assert positions is not None
-            _pos = positions[num_decode_tokens:num_tokens].to(torch.int32)
+            _pos = positions[num_decode_tokens:num_tokens]
             _buf = topk_indices_buffer[num_decode_tokens:num_tokens]
-            _fill_causal_indices(_buf, _pos)
+            kpool_ops.fill_causal_indices(_buf, _pos)
         # Under ShardQ the chunks index the shardq_gather_indices tokens.
         prefill_q, prefill_q_scale = q_quant, q_scale
         prefill_weights, prefill_positions = weights, positions
@@ -496,21 +495,23 @@ def sparse_attn_indexer_kpool(
             )
 
             if index_kpool > 1:
-                pool_ids = pool_topk.to(torch.int64)
                 if prefill_positions is not None:
-                    # Fused expand-pools + append-tail into one Triton kernel
-                    # (replaces ~25 elementwise ops). seq_len is token-granular
-                    # (pos+1); the kernel derives pool_len internally.
-                    q_seq = prefill_positions[row_start:row_end].to(torch.int32) + 1
-                    expanded = kpool_ops.expand_pools_and_append_tail(
-                        pool_ids, q_seq, index_kpool
+                    kpool_ops.expand_pools_and_append_tail(
+                        pool_topk,
+                        prefill_positions[row_start:row_end],
+                        index_kpool,
+                        seq_offset=1,
+                        out=topk_indices_buffer[row_start:row_end],
                     )
                 else:
+                    pool_ids = pool_topk.to(torch.int64)
                     valid = pool_ids >= 0
                     expanded = kpool_ops.expand_pools_to_tokens(
                         pool_ids, valid, topk_tokens, index_kpool
                     )
-                topk_indices_buffer[row_start:row_end, : expanded.shape[-1]] = expanded
+                    topk_indices_buffer[row_start:row_end, : expanded.shape[-1]] = (
+                        expanded
+                    )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode

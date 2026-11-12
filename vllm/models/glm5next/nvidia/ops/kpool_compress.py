@@ -860,6 +860,46 @@ def append_tail_to_topk(
 
 
 @triton.jit
+def _fill_causal_indices_kernel(
+    out_ptr,
+    positions_ptr,
+    width,
+    out_stride_row,
+    out_stride_col,
+    positions_stride,
+    BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+    position = tl.load(positions_ptr + row * positions_stride).to(tl.int32)
+    indices = tl.where(cols <= position, cols, -1)
+    tl.store(
+        out_ptr + row * out_stride_row + cols.to(tl.int64) * out_stride_col,
+        indices,
+        mask=cols < width,
+    )
+
+
+def fill_causal_indices(out: torch.Tensor, positions: torch.Tensor) -> None:
+    """Write causal token indices and sentinel columns directly into `out`."""
+    assert out.ndim == 2 and positions.ndim == 1
+    assert out.shape[0] == positions.shape[0]
+    assert out.device == positions.device
+    if out.numel() == 0:
+        return
+    block_cols = 256
+    _fill_causal_indices_kernel[(out.shape[0], triton.cdiv(out.shape[1], block_cols))](
+        out,
+        positions,
+        out.shape[1],
+        out.stride(0),
+        out.stride(1),
+        positions.stride(0),
+        BLOCK_COLS=block_cols,
+    )
+
+
+@triton.jit
 def _expand_pools_and_append_tail_kernel(
     pool_ids_ptr,  # [rows, n_groups], int (any int dtype)
     seq_lens_ptr,  # [rows], int32 (token-granular seq_len)
