@@ -12,6 +12,7 @@ from transformers import PreTrainedConfig
 
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_eh_norm import fused_eh_norm
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -371,11 +372,16 @@ class HYV4MultiTokenPredictorLayer(nn.Module):
     ) -> torch.Tensor:
         del input_ids  # embeddings are resolved by the caller
         assert inputs_embeds is not None
-        inputs_embeds = self.enorm(inputs_embeds)
-        previous_hidden_states = self.hnorm(previous_hidden_states)
-        hidden_states = self.eh_proj(
-            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+        hidden_states = fused_eh_norm(
+            positions,
+            inputs_embeds,
+            previous_hidden_states,
+            self.enorm.weight,
+            self.hnorm.weight,
+            self.enorm.variance_epsilon,
+            hnorm_eps=self.hnorm.variance_epsilon,
         )
+        hidden_states = self.eh_proj(hidden_states)
         hidden_states, residual = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
@@ -493,7 +499,6 @@ class HYV4MultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        inputs_embeds = torch.where((positions == 0).unsqueeze(-1), 0, inputs_embeds)
 
         current_step_idx = self.spec_step_idx % self.num_mtp_layers
         return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
