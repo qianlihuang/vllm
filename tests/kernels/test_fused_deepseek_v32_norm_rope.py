@@ -1034,6 +1034,48 @@ def test_fused_q_triton_supports_large_token_count():
 # ── fused_eh_norm (MTP) ──────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [1, 17, 0])
+@pytest.mark.parametrize("strided", [False, True])
+def test_fused_eh_norm_preserves_independent_norm_eps(dtype, num_tokens, strided):
+    torch.manual_seed(4)
+    hidden = 6144
+    positions = torch.arange(num_tokens, device="cuda")
+    stride = 2 if strided else 1
+    embeds = torch.randn(num_tokens, hidden * stride, device="cuda", dtype=dtype)
+    previous = torch.randn_like(embeds)
+    embeds = embeds[:, ::stride].mul_(0.01)
+    previous = previous[:, ::stride].mul_(0.01)
+    enorm_weight = torch.randn(hidden, device="cuda", dtype=dtype)
+    hnorm_weight = torch.randn_like(enorm_weight)
+    hnorm_eps = 1e-3
+    actual = K.fused_eh_norm(
+        positions,
+        embeds,
+        previous,
+        enorm_weight,
+        hnorm_weight,
+        EPS,
+        hnorm_eps=hnorm_eps,
+    )
+    masked = torch.where(positions[:, None] == 0, 0.0, embeds).float()
+    normalized_embeds = masked * torch.rsqrt(
+        masked.square().mean(-1, keepdim=True) + EPS
+    )
+    previous = previous.float()
+    normalized_hidden = previous * torch.rsqrt(
+        previous.square().mean(-1, keepdim=True) + hnorm_eps
+    )
+    expected = torch.cat(
+        [
+            (normalized_embeds * enorm_weight.float()).to(dtype),
+            (normalized_hidden * hnorm_weight.float()).to(dtype),
+        ],
+        dim=-1,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("cfg", MODEL_CONFIGS, ids=MODEL_IDS)
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 512])
 def test_fused_eh_norm(num_tokens: int, cfg: ModelConfig):
