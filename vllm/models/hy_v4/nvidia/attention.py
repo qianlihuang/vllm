@@ -38,8 +38,11 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
-from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    SparseAttnIndexer,
+    fused_indexer_q_rope_quant,
+)
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.utils import compute_skip_topk_layers
@@ -132,6 +135,13 @@ class Indexer(nn.Module):
 
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128
+        self.use_fused_q_preparation = (
+            current_platform.is_cuda()
+            and vllm_config.model_config.dtype == torch.bfloat16
+            and self.head_dim == 128
+            and self.rope_dim == 64
+            and RotaryEmbedding.enabled()
+        )
         self.topk_indices_buffer = topk_indices_buffer
 
         # FP8 naive cache: values in fp8 plus one fp32 scale per
@@ -182,11 +192,6 @@ class Indexer(nn.Module):
         """Build the quantized query, key and per-head weights of the indexer."""
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        # Checkpoint (PTM) layout: pe occupies the LAST rope_dim dims.
-        q_nope, q_pe = torch.split(
-            q, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
-        )
-
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
@@ -194,6 +199,27 @@ class Indexer(nn.Module):
         k = self.k_norm(k)
         k_nope, k_pe = torch.split(
             k, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
+        )
+
+        if self.use_fused_q_preparation and isinstance(rotary_emb, RotaryEmbedding):
+            k_pe, _ = rotary_emb(positions, k_pe.unsqueeze(1))
+            k = torch.cat([k_nope, k_pe.reshape(-1, self.rope_dim)], dim=-1)
+            q_fp8, weights = fused_indexer_q_rope_quant(
+                positions,
+                q,
+                rotary_emb.cos_sin_cache,
+                weights,
+                self.softmax_scale,
+                self.n_head**-0.5,
+                is_neox=False,
+                rope_dim_offset=self.head_dim - self.rope_dim,
+                scale_min=1e-10,
+            )
+            return hidden_states, q_fp8, k, weights
+
+        # Checkpoint (PTM) layout: pe occupies the LAST rope_dim dims.
+        q_nope, q_pe = torch.split(
+            q, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
         )
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))

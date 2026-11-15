@@ -265,6 +265,8 @@ def _fused_indexer_q_rope_quant_kernel(
     fp8_min: tl.constexpr,
     fp8_max: tl.constexpr,
     is_neox: tl.constexpr,
+    rope_dim_offset: tl.constexpr,
+    scale_min: tl.constexpr,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -276,46 +278,50 @@ def _fused_indexer_q_rope_quant_kernel(
     sin = tl.load(cos_sin_cache + pos * cos_sin_s0 + 32 + offs32).to(tl.float32)
     q_base = q + token * q_s0 + head * q_s1
     out_base = q_fp8 + token * q_fp8_s0 + head * q_fp8_s1
+    q_rot_base = q_base + rope_dim_offset
+    out_rot_base = out_base + rope_dim_offset
 
     if is_neox:
-        # NeoX layout, x0 = q[0:32], x1 = q[32:64]
-        x0 = tl.load(q_base + offs32).to(tl.float32)
-        x1 = tl.load(q_base + 32 + offs32).to(tl.float32)
+        # NeoX layout within the rotated half.
+        x0 = tl.load(q_rot_base + offs32).to(tl.float32)
+        x1 = tl.load(q_rot_base + 32 + offs32).to(tl.float32)
     else:
-        # interleaved layout
-        # x0 = q[0, 2, 4, ...], x1 = q[1, 3, 5, ...]
-        x0 = tl.load(q_base + offs32 * 2).to(tl.float32)
-        x1 = tl.load(q_base + offs32 * 2 + 1).to(tl.float32)
+        # Interleaved pairs within the rotated half.
+        x0 = tl.load(q_rot_base + offs32 * 2).to(tl.float32)
+        x1 = tl.load(q_rot_base + offs32 * 2 + 1).to(tl.float32)
     r0 = (x0 * cos - x1 * sin).to(tl.bfloat16).to(tl.float32)
     r1 = (x1 * cos + x0 * sin).to(tl.bfloat16).to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(r0)), tl.max(tl.abs(r1)))
 
-    q_nope = tl.load(q_base + 64 + offs64).to(tl.float32)
+    nope_offset: tl.constexpr = 64 - rope_dim_offset
+    q_nope = tl.load(q_base + nope_offset + offs64).to(tl.float32)
     amax = tl.maximum(amax, tl.max(tl.abs(q_nope)))
     scale_raw = tl.maximum(amax, 1e-10) * (1.0 / fp8_max)
+    if scale_min > 0:
+        scale_raw = tl.maximum(scale_raw, scale_min)
     # e8m0 format
     q_scale = tl.math.exp2(tl.ceil(tl.log2(scale_raw)))
 
     if is_neox:
         tl.store(
-            out_base + offs32,
+            out_rot_base + offs32,
             tl.clamp(r0 / q_scale, fp8_min, fp8_max).to(q_fp8.dtype.element_ty),
         )
         tl.store(
-            out_base + 32 + offs32,
+            out_rot_base + 32 + offs32,
             tl.clamp(r1 / q_scale, fp8_min, fp8_max).to(q_fp8.dtype.element_ty),
         )
     else:
         tl.store(
-            out_base + offs32 * 2,
+            out_rot_base + offs32 * 2,
             tl.clamp(r0 / q_scale, fp8_min, fp8_max).to(q_fp8.dtype.element_ty),
         )
         tl.store(
-            out_base + offs32 * 2 + 1,
+            out_rot_base + offs32 * 2 + 1,
             tl.clamp(r1 / q_scale, fp8_min, fp8_max).to(q_fp8.dtype.element_ty),
         )
     tl.store(
-        out_base + 64 + offs64,
+        out_base + nope_offset + offs64,
         tl.clamp(q_nope / q_scale, fp8_min, fp8_max).to(q_fp8.dtype.element_ty),
     )
 
@@ -334,12 +340,21 @@ def fused_indexer_q_rope_quant(
     softmax_scale: float,
     head_scale: float,
     is_neox: bool,
+    *,
+    rope_dim_offset: int = 0,
+    scale_min: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse query RoPE, FP8 quantization and head-weight scaling.
+
+    `rope_dim_offset` selects the rotated half. `scale_min` bounds the scale
+    before UE8M0 rounding.
+    """
     assert current_platform.is_cuda()
     assert q.dtype == torch.bfloat16
     assert q.shape[-1] == 128
     assert cos_sin_cache.shape[-1] == 64
     assert weights.shape == q.shape[:2]
+    assert rope_dim_offset in (0, 64)
 
     q_fp8 = torch.empty_like(q, dtype=current_platform.fp8_dtype())
     weights_out = torch.empty_like(weights, dtype=torch.float32)
@@ -365,6 +380,8 @@ def fused_indexer_q_rope_quant(
         fp8_min=fp8_min,
         fp8_max=fp8_max,
         is_neox=is_neox,
+        rope_dim_offset=rope_dim_offset,
+        scale_min=scale_min,
         num_warps=1,
     )
     return q_fp8, weights_out

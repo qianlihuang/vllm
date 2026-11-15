@@ -24,6 +24,9 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    fused_indexer_q_rope_quant as fused_sparse_indexer_q_rope_quant,
+)
 from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
@@ -619,3 +622,49 @@ def test_fused_indexer_q_rope_quant_writes_bf16_weights(use_cutedsl):
         )
     assert weights_fused.dtype == torch.bfloat16
     assert torch.equal(weights_fused, weights_ref.to(torch.bfloat16))
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("rope_dim_offset", [0, 64])
+@pytest.mark.parametrize("is_neox", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 17, 257])
+@pytest.mark.parametrize("input_scale", [0.0, 1e-6, 1.0])
+@torch.inference_mode()
+def test_sparse_indexer_rope_offset_preserves_quantization(
+    rope_dim_offset, is_neox, num_tokens, input_scale
+):
+    torch.manual_seed(42)
+    q = torch.randn(num_tokens, 64, HEAD_DIM, device="cuda", dtype=torch.bfloat16)[
+        :, ::2
+    ]
+    q.mul_(input_scale)
+    positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64) * 13
+    cache = torch.randn(MAX_POS, ROPE_DIM, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(num_tokens, 160, device="cuda", dtype=torch.bfloat16)[:, 128:]
+    softmax_scale, head_scale = HEAD_DIM**-0.5, 32**-0.5
+    rotated = q.clone()
+    ops.rotary_embedding(
+        positions, rotated, None, HEAD_DIM, cache, is_neox, rope_dim_offset, False
+    )
+    expected_q, scale = per_token_group_quant_fp8(
+        rotated.reshape(-1, HEAD_DIM), HEAD_DIM, use_ue8m0=True
+    )
+    expected_weights = weights.float() * scale.view(num_tokens, 32)
+    expected_weights = expected_weights * softmax_scale * head_scale
+
+    actual_q, actual_weights = fused_sparse_indexer_q_rope_quant(
+        positions,
+        q,
+        cache,
+        weights,
+        softmax_scale,
+        head_scale,
+        is_neox,
+        rope_dim_offset=rope_dim_offset,
+        scale_min=1e-10,
+    )
+    assert torch.equal(
+        actual_q.view(torch.int8),
+        expected_q.view(num_tokens, 32, HEAD_DIM).view(torch.int8),
+    )
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=0, atol=0)
