@@ -90,13 +90,13 @@ def test_ihc_shards_rows_and_preserves_generation(
     modes = [("off", False), ("auto", False)]
     if kv_cache_dtype == "fp8_ds_mla":
         modes += [("auto", True), ("off", True)]
-    for model_sp, use_shardq in modes:
+    for hc_sp, use_shardq in modes:
         with vllm_runner(
             str(tmp_path),
             load_format="dummy",
             skip_tokenizer_init=True,
             tensor_parallel_size=2,
-            model_sequence_parallel=model_sp,
+            hc_sequence_parallel=hc_sp,
             enable_expert_parallel=True,
             dtype="bfloat16",
             enforce_eager=enforce_eager,
@@ -119,7 +119,7 @@ def test_ihc_shards_rows_and_preserves_generation(
                     partial(
                         _check_ihc_rows,
                         min_tokens=1024,
-                        enabled=model_sp == "auto",
+                        enabled=hc_sp == "auto",
                     )
                 )
             runs: list[CompletionOutput] = []
@@ -136,7 +136,7 @@ def test_ihc_shards_rows_and_preserves_generation(
                     any(shardq for _, _, shardq in rows) == use_shardq
                     for rows in observed
                 )
-                if model_sp == "auto":
+                if hc_sp == "auto":
                     assert all(
                         any(
                             full > local and (shardq or not use_shardq)
@@ -148,6 +148,6 @@ def test_ihc_shards_rows_and_preserves_generation(
         check_logprobs_close(
             outputs_0_lst=[(list(r.token_ids), r.text, r.logprobs) for r in outputs[0]],
             outputs_1_lst=[(list(r.token_ids), r.text, r.logprobs) for r in result],
-            name_0="model_sp=off, shardq=False",
-            name_1=f"model_sp={mode[0]}, shardq={mode[1]}",
+            name_0="hc_sp=off, shardq=False",
+            name_1=f"hc_sp={mode[0]}, shardq={mode[1]}",
         )

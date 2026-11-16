@@ -52,7 +52,6 @@ from .interfaces import (
     supports_hc_sp,
     supports_kv_cache_grouping,
     supports_lora,
-    supports_model_sp,
     supports_multimodal,
     supports_multimodal_encoder_tp_data,
     supports_multimodal_raw_input_only,
@@ -964,7 +963,6 @@ class _ModelInfo:
     supports_pp: bool
     supports_lora: bool
     supports_hc_sp: bool
-    supports_model_sp: bool
     has_inner_state: bool
     is_attention_free: bool
     is_hybrid: bool
@@ -1001,7 +999,6 @@ class _ModelInfo:
             supports_pp=supports_pp(model),
             supports_lora=supports_lora(model),
             supports_hc_sp=supports_hc_sp(model),
-            supports_model_sp=supports_model_sp(model),
             has_inner_state=has_inner_state(model),
             is_attention_free=is_attention_free(model),
             is_hybrid=is_hybrid(model),
@@ -1601,14 +1598,6 @@ class _ModelRegistry:
         """Check support for HC SP without changing MoE parallelism."""
         model_info, _ = self.inspect_model_cls(architectures, model_config)
         return model_info.supports_hc_sp
-
-    def is_model_sp_supported_model(
-        self,
-        architectures: str | list[str],
-        model_config: ModelConfig,
-    ) -> bool:
-        model_info, _ = self.inspect_model_cls(architectures, model_config)
-        return model_info.supports_model_sp
 
     def model_has_inner_state(
         self,

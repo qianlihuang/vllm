@@ -1406,7 +1406,7 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         if text_config.hc_count <= 1:
             raise ValueError("Qwen4Exp requires hc_count > 1")
         parallel_config = vllm_config.parallel_config
-        # MoE SP also enables HC SP without the explicit HC flag.
+        # The MoE SP schedule currently requires a single pipeline stage.
         if (
             current_platform.is_cuda_alike()
             and parallel_config.use_sequence_parallel_moe

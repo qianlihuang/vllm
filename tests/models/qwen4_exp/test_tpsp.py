@@ -71,15 +71,15 @@ class _TPAttentionProjection(nn.Module):
         return self.proj(hidden_states)[0]
 
 
-def _make_config(rank: int, *, hc_sp: bool = False, moe_sp: bool = False) -> VllmConfig:
-    """Configure HC SP explicitly or MoE SP through TP=2, DP=2 and EP."""
+def _make_config(rank: int, *, hc_sp: bool = True, moe_sp: bool = False) -> VllmConfig:
+    """Select HC SP independently of MoE SP through TP=2, DP=2 and EP."""
     config = VllmConfig(
         parallel_config=ParallelConfig(
             tensor_parallel_size=2,
             data_parallel_size=2 if moe_sp else 1,
             data_parallel_rank=rank // 2,
             enable_expert_parallel=moe_sp,
-            enable_hc_sp=hc_sp,
+            hc_sequence_parallel="auto" if hc_sp else "off",
             all2all_backend="allgather_reducescatter",
         ),
     )
@@ -169,7 +169,7 @@ def _check_decoder_ple(rank: int) -> None:
         for config, layer in zip(configs, layers):
             assert layer.ple is not None
             inputs = (hidden, block, injection)
-            if config.parallel_config.enable_hc_sp:
+            if layer.use_hc_sequence_parallel:
                 inputs = tuple(sp_shard(x) for x in inputs)
             with (
                 set_current_vllm_config(config),
@@ -184,7 +184,7 @@ def _check_decoder_ple(rank: int) -> None:
                     query_start_loc=qsl,
                     ngram_context=context,
                 )
-                if config.parallel_config.enable_hc_sp:
+                if layer.use_hc_sequence_parallel:
                     # ROCm all-gather requires contiguous inputs.
                     output = tuple(
                         sp_all_gather(x.contiguous())[:num_tokens] for x in output
@@ -198,6 +198,9 @@ def _check_decoder_ple(rank: int) -> None:
 def _check_moe_sp(rank: int, config: VllmConfig) -> None:
     """Compare native SP with full-token GR and the MoE wrapper's public interface."""
     layer = _make_decoder(config, rank)
+    assert layer.use_hc_sequence_parallel is (
+        config.parallel_config.hc_sequence_parallel == "auto"
+    )
     dp_rank = config.parallel_config.data_parallel_rank
     counts = torch.tensor([3, 5], device="cpu")
     num_tokens = int(counts[dp_rank])
@@ -218,7 +221,9 @@ def _check_moe_sp(rank: int, config: VllmConfig) -> None:
     ):
         # The reference keeps full GR rows. MoE handles its own chunk and gather.
         full_hidden, attn_input, injection = layer.attn_hyper_connection.mix(hidden)
-        attn_output = tensor_model_parallel_all_reduce(layer.linear_attn(attn_input))
+        attn_output = layer.linear_attn(attn_input)
+        if layer.use_hc_sequence_parallel:
+            attn_output = tensor_model_parallel_all_reduce(attn_output)
         full_hidden, moe_input, injection = layer.mlp_hyper_connection.combine_and_mix(
             full_hidden, attn_output, injection
         )
@@ -227,7 +232,7 @@ def _check_moe_sp(rank: int, config: VllmConfig) -> None:
             x.clone() for x in (full_hidden, layer.mlp(moe_input), injection)
         )
         output = layer(
-            sp_shard(hidden),
+            sp_shard(hidden) if layer.use_hc_sequence_parallel else hidden,
             None,
             None,
             positions,
@@ -235,7 +240,11 @@ def _check_moe_sp(rank: int, config: VllmConfig) -> None:
             query_start_loc=None,
             ngram_context=None,
         )
-        actual = tuple(sp_all_gather(x.contiguous())[:num_tokens] for x in output)
+        actual = (
+            tuple(sp_all_gather(x.contiguous())[:num_tokens] for x in output)
+            if layer.use_hc_sequence_parallel
+            else output
+        )
     torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.02)
 
 
@@ -266,11 +275,17 @@ def _check_compiled_sp_ops() -> None:
         torch.testing.assert_close(compiled(x), collectives(x), atol=0, rtol=0)
 
 
-def _run_sp(rank: int, port: int, moe_sp: bool, compiled_ops: bool = False) -> None:
+def _run_sp(
+    rank: int,
+    port: int,
+    moe_sp: bool,
+    compiled_ops: bool = False,
+    hc_sp: bool = True,
+) -> None:
     """Initialize rank-local runtime state and run one equivalence check."""
     torch.accelerator.set_device_index(rank)
     torch.set_num_threads(1)
-    config = _make_config(rank, moe_sp=moe_sp)
+    config = _make_config(rank, hc_sp=hc_sp, moe_sp=moe_sp)
     init_distributed_environment(
         world_size=4 if moe_sp else 2,
         rank=rank,
@@ -302,10 +317,11 @@ def test_hc_sp_decoder_and_ple() -> None:
 
 
 @multi_gpu_test(num_gpus=4)
-def test_moe_sp_equivalence(monkeypatch) -> None:
+@pytest.mark.parametrize("hc_sp", [False, True])
+def test_moe_sp_equivalence(monkeypatch, hc_sp) -> None:
     """Native MoE SP preserves outputs with unequal DP batches and padding."""
     monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
-    mp.spawn(_run_sp, args=(get_open_port(), True), nprocs=4)
+    mp.spawn(_run_sp, args=(get_open_port(), True, False, hc_sp), nprocs=4)
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only SP ops")

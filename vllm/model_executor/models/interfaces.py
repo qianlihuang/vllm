@@ -912,27 +912,6 @@ def _supports_pp_inspect(model: type[object] | object) -> bool:
 
 
 @runtime_checkable
-class SupportsModelSP(Protocol):
-    """Support the auto/off policy for model-level sequence parallelism."""
-
-    supports_model_sp: ClassVar[Literal[True]] = True
-
-
-@overload
-def supports_model_sp(model: type[object]) -> TypeIs[type[SupportsModelSP]]: ...
-
-
-@overload
-def supports_model_sp(model: object) -> TypeIs[SupportsModelSP]: ...
-
-
-def supports_model_sp(
-    model: type[object] | object,
-) -> TypeIs[type[SupportsModelSP]] | TypeIs[SupportsModelSP]:
-    return getattr(model, "supports_model_sp", False)
-
-
-@runtime_checkable
 class SupportsHCSP(Protocol):
     """Support sequence-parallel HC without changing MoE parallelism."""
 

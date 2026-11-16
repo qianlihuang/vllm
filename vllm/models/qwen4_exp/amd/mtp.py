@@ -189,7 +189,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         config: Qwen4ExpTextConfig = model_config.hf_text_config
 
         self.config = config
-        # MoE SP also enables HC SP, while HC SP can be enabled independently.
         self.use_hc_sequence_parallel = is_hc_sequence_parallel_enabled(vllm_config)
         self.vocab_size = config.vocab_size
 

@@ -26,18 +26,22 @@ The `GPU KV cache size` line reports the total number of tokens that can be stor
 
 It's often advantageous to exploit the inherent parallelism of experts by using a separate parallelism strategy for the expert layers. vLLM supports large-scale deployment combining Data Parallel attention with Expert or Tensor Parallel MoE layers. For more information, see [Data Parallel Deployment](data_parallel_deployment.md).
 
-### Model-level sequence parallelism
+### HyperConnection sequence parallelism
 
-`--model-sequence-parallel auto` lets supported models select token-sharded
-residual and normalization computation by topology and batch size. HY4 on
-CUDA initially supports this policy and selects iHC SP with TP>1,
-DP1/PP1/PCP1/DCP1 and at least 1024 model token rows. The existing LoRA,
-batch-invariance, auxiliary-hidden-state and MoE compatibility checks apply.
-Attention ShardQ has its own eligibility and token threshold.
+`--hc-sequence-parallel auto` is the default. Supported models select
+token-sharded HyperConnection (HC) computation by topology and batch size.
+HY4 on CUDA selects iHC SP with TP>1, DP1/PP1/PCP1/DCP1 and at least 1024
+model token rows. Its existing LoRA, batch-invariance, auxiliary-hidden-state
+and MoE compatibility checks apply. Qwen4Exp on CUDA/ROCm selects HC SP
+with TP>1 and PP1, including TP-only deployments.
 
-Use `--model-sequence-parallel off` to keep the model stream replicated.
-With TP>1, explicit `off` requires an implementation supporting this policy.
-Expert dispatch continues to use its configured backend and layout.
+Use `--hc-sequence-parallel off` to keep HC rows replicated. Models without
+HC ignore this option. Attention ShardQ and MoE SP have independent controls.
+
+The deprecated `--enable-hc-sp` option maps to `auto` and
+`--disable-hc-sp` maps to `off`. Explicit `off` takes precedence when both
+spellings are supplied. Python callers can use `hc_sequence_parallel`;
+the deprecated `enable_hc_sp=True/False` arguments follow the same mapping.
 
 ## Single-node deployment
 

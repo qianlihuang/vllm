@@ -10,7 +10,7 @@ import pytest
 import torch
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
-from vllm.config import CacheConfig, ParallelConfig
+from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
@@ -20,6 +20,9 @@ from vllm.model_executor.models.config import (
 )
 from vllm.models.qwen4_exp.amd.model_state import (
     Qwen4ExpModelState as AmdQwen4ExpModelState,
+)
+from vllm.models.qwen4_exp.common.hyperconnection import (
+    is_hc_sequence_parallel_enabled,
 )
 from vllm.models.qwen4_exp.nvidia.model import (
     Qwen4ExpForCausalLM,
@@ -57,6 +60,35 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     }
     values.update(kwargs)
     return Qwen4ExpTextConfig(**values)
+
+
+@pytest.mark.parametrize(
+    "mode,tp_size,pp_size,moe_sp,expected",
+    [
+        ("auto", 2, 1, False, True),
+        ("off", 2, 1, False, False),
+        ("auto", 2, 1, True, True),
+        ("off", 2, 1, True, False),
+        ("auto", 1, 1, False, False),
+        ("auto", 2, 2, False, False),
+    ],
+)
+def test_hc_sp_policy_selects_layout_independently_of_moe(
+    mode, tp_size, pp_size, moe_sp, expected
+):
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            hc_sequence_parallel=mode,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            data_parallel_size=2 if moe_sp else 1,
+            enable_expert_parallel=moe_sp,
+            all2all_backend="allgather_reducescatter",
+            distributed_executor_backend="mp",
+        )
+    )
+    assert config.parallel_config.use_sequence_parallel_moe is moe_sp
+    assert is_hc_sequence_parallel_enabled(config) is expected
 
 
 def test_moe_sp_rejects_pipeline_parallel() -> None:

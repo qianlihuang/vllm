@@ -50,8 +50,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_v2 import _try_load_fp8_indexer_wk
 from vllm.model_executor.models.interfaces import (
+    SupportsHCSP,
     SupportsLoRA,
-    SupportsModelSP,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
@@ -86,7 +86,7 @@ from .moe import HYV4FeedForward, HYV4MoEFused
 
 logger = init_logger(__name__)
 
-_MODEL_SP_MIN_TOKENS = 1024
+_HC_SP_MIN_TOKENS = 1024
 
 
 def _normalize_hyv4_config(config: PreTrainedConfig) -> PreTrainedConfig:
@@ -278,7 +278,7 @@ class HYV4Model(nn.Module):
         self.enable_ihc = getattr(config, "enable_ihc", False)
         speculative_config = vllm_config.speculative_config
         use_sequence_parallel = (
-            parallel_config.model_sequence_parallel == "auto"
+            parallel_config.hc_sequence_parallel == "auto"
             and self.enable_ihc
             and parallel_config.tensor_parallel_size > 1
             and parallel_config.data_parallel_size == 1
@@ -428,7 +428,7 @@ class HYV4Model(nn.Module):
         use_sequence_parallel = is_sequence_parallel_active(
             self.use_sequence_parallel,
             full_num_tokens,
-            min_tokens=_MODEL_SP_MIN_TOKENS,
+            min_tokens=_HC_SP_MIN_TOKENS,
         )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -678,7 +678,7 @@ class HYV4Model(nn.Module):
         return loaded_params
 
 
-class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsModelSP):
+class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsHCSP):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             ".q_a_proj": (".fused_qkv_a_proj", 0),

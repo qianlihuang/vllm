@@ -187,7 +187,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         config: Qwen4ExpTextConfig = model_config.hf_text_config
 
         self.config = config
-        # MoE SP also enables HC SP, while HC SP can be enabled independently.
         self.use_hc_sequence_parallel = is_hc_sequence_parallel_enabled(vllm_config)
         self.use_sequence_parallel = (
             vllm_config.parallel_config.use_sequence_parallel_moe
@@ -342,16 +341,16 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         full_num_tokens = positions.shape[-1]
+        if (
+            self.use_sequence_parallel
+            and envs.VLLM_MOE_SKIP_PADDING
+            and is_forward_context_available()
+        ):
+            forward_context = get_forward_context()
+            forward_context.is_padding = sp_padding_mask(
+                forward_context.is_padding, hidden_states
+            )
         if self.use_hc_sequence_parallel:
-            if (
-                self.use_sequence_parallel
-                and envs.VLLM_MOE_SKIP_PADDING
-                and is_forward_context_available()
-            ):
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
-                )
             hidden_states = sp_shard(hidden_states)
             # The FC output is already complete and needs only a slice.
             prev_block_output = sp_shard(prev_block_output)

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import json
 import warnings
 
 import pytest
@@ -134,6 +133,7 @@ def test_registry_is_pp(model_arch, is_pp):
         ("Qwen4ExpForCausalLM", True),
         ("Qwen4ExpForConditionalGeneration", True),
         ("Qwen4ExpMTP", True),
+        ("HYV4ForCausalLM", not current_platform.is_rocm()),
         ("LlamaForCausalLM", False),
     ],
 )
@@ -142,16 +142,6 @@ def test_registry_supports_hc_sp(model_arch, supported):
     model_info = ModelRegistry._try_inspect_model_cls(model_arch)
     assert model_info is not None
     assert model_info.supports_hc_sp is supported
-
-
-@pytest.mark.parametrize(
-    "model_arch,supported",
-    [("HYV4ForCausalLM", True), ("LlamaForCausalLM", False)],
-)
-def test_registry_supports_model_sp(model_arch, supported):
-    model_info = ModelRegistry._try_inspect_model_cls(model_arch)
-    assert model_info is not None
-    assert model_info.supports_model_sp is supported
 
 
 @pytest.mark.parametrize(
@@ -232,21 +222,6 @@ def test_lazy_modelinfo_package_hash_includes_submodules(tmp_path):
     second_hash = _LazyRegisteredModel._get_modelinfo_module_hash(init_file)
 
     assert first_hash != second_hash
-
-
-def test_modelinfo_cache_without_model_sp_capability_is_refreshed(
-    monkeypatch, tmp_path
-):
-    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
-    model = _LazyRegisteredModel("vllm.model_executor.models.llama", "LlamaForCausalLM")
-    model.inspect_model_cls()
-    path = model._get_cache_dir() / model._get_cache_filename()
-    cached = json.loads(path.read_text())
-    del cached["modelinfo"]["supports_model_sp"]
-    path.write_text(json.dumps(cached))
-
-    assert model.inspect_model_cls().supports_model_sp is False
-    assert json.loads(path.read_text())["modelinfo"]["supports_model_sp"] is False
 
 
 def test_lazy_modelinfo_package_attempts_cache_load(monkeypatch):

@@ -2581,13 +2581,15 @@ def test_dspark_draft_eplb_rejects_elastic_ep_unless_disabled(
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("target_ep", [False, True], ids=["ep-off", "ep-on"])
 @pytest.mark.parametrize("pass_none", [False, True], ids=["omitted", "explicit-none"])
+@pytest.mark.parametrize("hc_mode", ["auto", "off"])
 def test_draft_parallel_config_preserves_ep_without_model(
-    target_ep: bool, pass_none: bool
+    target_ep: bool, pass_none: bool, hc_mode: str
 ):
-    """Legacy callers without draft model information keep EP inheritance."""
+    """Drafts inherit EP and HC policy when model metadata is absent."""
     target_parallel_config = ParallelConfig(
         tensor_parallel_size=2,
         enable_expert_parallel=target_ep,
+        hc_sequence_parallel=hc_mode,
         distributed_executor_backend="mp",
     )
     if pass_none:
@@ -2601,6 +2603,7 @@ def test_draft_parallel_config_preserves_ep_without_model(
 
     assert draft_parallel_config.enable_expert_parallel is target_ep
     assert draft_parallel_config.tensor_parallel_size == 2
+    assert draft_parallel_config.hc_sequence_parallel == hc_mode
     assert target_parallel_config.enable_expert_parallel is target_ep
 
 
@@ -4874,10 +4877,10 @@ def test_hc_sp_model_support(enabled, supported, cuda_alike, tp_size, pp_size, e
             ModelConfig.verify_with_parallel_config(model, parallel)
 
 
-def test_model_sp_policy_affects_compilation_hash():
+def test_hc_sp_policy_affects_compilation_hash():
     configs = [
         ParallelConfig(
-            model_sequence_parallel=mode,
+            hc_sequence_parallel=mode,
             tensor_parallel_size=2,
             distributed_executor_backend="mp",
         )
@@ -4886,7 +4889,8 @@ def test_model_sp_policy_affects_compilation_hash():
     assert hash_config(configs[0]) != hash_config(configs[1])
 
 
-def test_model_sp_off_rejects_unmigrated_model(tmp_path):
+@pytest.mark.parametrize("mode", ["auto", "off"])
+def test_hc_sp_policy_is_noop_for_model_without_hc(tmp_path, mode):
     from transformers import LlamaConfig
 
     LlamaConfig(
@@ -4900,12 +4904,37 @@ def test_model_sp_off_rejects_unmigrated_model(tmp_path):
     ).save_pretrained(tmp_path)
     model = ModelConfig(model=str(tmp_path), skip_tokenizer_init=True)
     parallel = ParallelConfig(
-        model_sequence_parallel="off",
+        hc_sequence_parallel=mode,
         tensor_parallel_size=2,
         distributed_executor_backend="mp",
     )
-    with pytest.raises(ValueError, match="does not support --model-sequence-parallel"):
-        model.verify_with_parallel_config(parallel)
+    model.verify_with_parallel_config(parallel)
+
+
+@pytest.mark.parametrize(
+    "mode,legacy,expected",
+    [
+        ("auto", None, "auto"),
+        ("off", None, "off"),
+        ("auto", True, "auto"),
+        ("off", True, "off"),
+        ("auto", False, "off"),
+    ],
+)
+def test_legacy_hc_sp_normalizes_to_policy(mode, legacy, expected):
+    parallel = ParallelConfig(
+        hc_sequence_parallel=mode,
+        enable_hc_sp=legacy,
+        tensor_parallel_size=2,
+        distributed_executor_backend="mp",
+    )
+    canonical = ParallelConfig(
+        hc_sequence_parallel=expected,
+        tensor_parallel_size=2,
+        distributed_executor_backend="mp",
+    )
+    assert parallel.hc_sequence_parallel == expected
+    assert hash_config(parallel) == hash_config(canonical)
 
 
 @pytest.mark.parametrize(
