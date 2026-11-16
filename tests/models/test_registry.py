@@ -133,7 +133,6 @@ def test_registry_is_pp(model_arch, is_pp):
         ("Qwen4ExpForCausalLM", True),
         ("Qwen4ExpForConditionalGeneration", True),
         ("Qwen4ExpMTP", True),
-        ("HYV4ForCausalLM", not current_platform.is_rocm()),
         ("LlamaForCausalLM", False),
     ],
 )

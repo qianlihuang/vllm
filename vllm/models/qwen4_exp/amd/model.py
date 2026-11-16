@@ -194,6 +194,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         self.config = config
         self.layer_type = layer_type
+        # MoE SP also enables HC SP, while HC SP can be enabled independently.
         self.use_hc_sequence_parallel = is_hc_sequence_parallel_enabled(vllm_config)
         self.layer_idx = extract_layer_index(prefix)
         self.use_sequence_parallel = (
@@ -328,9 +329,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states, attn_out, injection
         )
         if self.use_sequence_parallel:
-            mlp_out = self.mlp(
-                block_input, already_sequence_parallel=self.use_hc_sequence_parallel
-            )
+            # MoE consumes local tokens and returns complete local outputs.
+            mlp_out = self.mlp(block_input, already_sequence_parallel=True)
         else:
             if self.use_hc_sequence_parallel:
                 block_input = sp_all_gather(block_input)[: positions.shape[-1]]
@@ -416,6 +416,7 @@ class Qwen4ExpModel(nn.Module):
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
+        # MoE SP also enables HC SP, while HC SP can be enabled independently.
         self.use_hc_sequence_parallel = is_hc_sequence_parallel_enabled(vllm_config)
         self.vocab_size = config.vocab_size
         self._qsa_layer_ids = frozenset(

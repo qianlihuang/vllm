@@ -39,12 +39,10 @@ from vllm.config import VllmConfig
 
 
 def is_hc_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
-    """Select HC/PLE token sharding independently of MoE parallelism."""
+    """Enable GR/PLE SP explicitly or automatically with sequence-parallel MoE."""
     parallel_config = vllm_config.parallel_config
-    return (
-        parallel_config.hc_sequence_parallel == "auto"
-        and parallel_config.tensor_parallel_size > 1
-        and parallel_config.pipeline_parallel_size == 1
+    return parallel_config.tensor_parallel_size > 1 and (
+        parallel_config.enable_hc_sp or parallel_config.use_sequence_parallel_moe
     )
 
 

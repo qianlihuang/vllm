@@ -43,7 +43,6 @@ def get_min_num_redundant_experts(num_logical_experts: int, ep_size: int) -> int
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
-HCSequenceParallelMode = Literal["auto", "off"]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 DBOSchedule = Literal["dispatch-combine-overlap", "all-reduce-overlap"]
@@ -209,17 +208,16 @@ class ParallelConfig:
     --data-parallel-start-rank."""
     is_moe_model: bool | None = None
     """Whether the deployed model is MoE (if known)."""
-    hc_sequence_parallel: HCSequenceParallelMode = "auto"
-    """Sequence-parallel policy for HyperConnection (HC) computation.
-    `auto` lets supported models select token-sharded HC computation by
-    topology and batch size. `off` keeps HC rows replicated. Supported by
-    HY4 on CUDA and Qwen4Exp on CUDA/ROCm. Models without HC ignore it.
-    Attention ShardQ and MoE parallelism retain their own configuration.
+    residual_sequence_parallel: Literal["auto", "off"] = "auto"
+    """Select optional token sharding for migrated residual implementations.
+    HY4 on CUDA supports `auto` with model-specific topology and token-count
+    checks. `off` keeps its iHC rows replicated. Attention ShardQ and MoE
+    dispatch have independent layout requirements.
     """
-    enable_hc_sp: bool | None = None
-    """Deprecated compatibility option for `hc_sequence_parallel`.
-    True selects `auto`, False selects `off`. An explicit `off` policy takes
-    precedence when both options are supplied.
+    enable_hc_sp: bool = False
+    """Enable sequence parallelism for HyperConnection (HC) computation.
+    Currently supported by Qwen4Exp on CUDA/ROCm with TP>1 and PP=1 (ignored when TP=1).
+    Does not change MoE parallelism. MoE SP may enable HC SP independently of this flag.
     """
     enable_expert_parallel: bool = False
     """Use expert parallelism instead of tensor parallelism for MoE layers."""
@@ -1046,8 +1044,6 @@ class ParallelConfig:
         `ignored_factors` if it does not affect the computation graph.
         """
         ignored_factors = {
-            # The compatibility flag is normalized into hc_sequence_parallel.
-            "enable_hc_sp",
             # Derived/runtime topology, networking, or launch details
             "data_parallel_rank",
             "data_parallel_rank_local",
@@ -1092,12 +1088,6 @@ class ParallelConfig:
         return get_compile_factors(self, ignored_factors)
 
     def __post_init__(self) -> None:
-        if self.enable_hc_sp is not None:
-            logger.warning_once(
-                "enable_hc_sp is deprecated. Use hc_sequence_parallel=auto/off instead."
-            )
-            if self.enable_hc_sp is False:
-                self.hc_sequence_parallel = "off"
         # Continue with the rest of the initialization
         self.world_size = (
             self.pipeline_parallel_size

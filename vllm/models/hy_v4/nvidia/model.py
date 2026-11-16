@@ -34,10 +34,7 @@ from transformers import PreTrainedConfig
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
-)
+from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -50,7 +47,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_v2 import _try_load_fp8_indexer_wk
 from vllm.model_executor.models.interfaces import (
-    SupportsHCSP,
     SupportsLoRA,
     SupportsPP,
 )
@@ -67,10 +63,10 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     pp_topk_buffers,
 )
+from vllm.models.common.ops.residual import ResidualBoundary
 from vllm.models.common.ops.sequence_parallel import (
     is_sequence_parallel_active,
     sp_all_gather,
-    sp_reduce_scatter,
     sp_shard,
 )
 from vllm.platforms import current_platform
@@ -144,6 +140,9 @@ class HYV4DecoderLayer(nn.Module):
             sequence_parallel=sequence_parallel and self.enable_ihc,
         )
         self.defer_reduction = not self.self_attn.o_proj.reduce_results
+        self.residual_boundary = ResidualBoundary(
+            output_is_partial=self.defer_reduction
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if config.mlp_layer_types[layer_idx] == "dense":
             self.mlp = HYV4FeedForward(
@@ -217,32 +216,32 @@ class HYV4DecoderLayer(nn.Module):
         hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
         hidden_states, post_gates, residual = self.hc_attn_layer.pre(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
-        if use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        hidden_states = self.residual_boundary.prepare_input(
+            hidden_states,
+            num_tokens=full_num_tokens,
+            sequence_parallel=use_sequence_parallel,
+        )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
-        if self.defer_reduction:
-            hidden_states = (
-                sp_reduce_scatter(hidden_states)
-                if use_sequence_parallel
-                else tensor_model_parallel_all_reduce(hidden_states)
-            )
+        hidden_states = self.residual_boundary.complete_output(
+            hidden_states, sequence_parallel=use_sequence_parallel
+        )
         hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
 
         hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
         hidden_states, post_gates, residual = self.hc_mlp_layer.pre(hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        hidden_states = self.residual_boundary.prepare_input(
+            hidden_states,
+            num_tokens=full_num_tokens,
+            sequence_parallel=use_sequence_parallel,
+        )
         hidden_states = self.mlp(hidden_states)
-        if self.defer_reduction:
-            hidden_states = (
-                sp_reduce_scatter(hidden_states)
-                if use_sequence_parallel
-                else tensor_model_parallel_all_reduce(hidden_states)
-            )
+        hidden_states = self.residual_boundary.complete_output(
+            hidden_states, sequence_parallel=use_sequence_parallel
+        )
         hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post_gates)
 
         # Under iHC the residual is carried inside hidden_states.
@@ -278,7 +277,7 @@ class HYV4Model(nn.Module):
         self.enable_ihc = getattr(config, "enable_ihc", False)
         speculative_config = vllm_config.speculative_config
         use_sequence_parallel = (
-            parallel_config.hc_sequence_parallel == "auto"
+            parallel_config.residual_sequence_parallel == "auto"
             and self.enable_ihc
             and parallel_config.tensor_parallel_size > 1
             and parallel_config.data_parallel_size == 1
@@ -678,7 +677,7 @@ class HYV4Model(nn.Module):
         return loaded_params
 
 
-class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsHCSP):
+class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             ".q_a_proj": (".fused_qkv_a_proj", 0),

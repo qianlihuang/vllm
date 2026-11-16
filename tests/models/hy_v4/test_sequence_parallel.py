@@ -90,13 +90,13 @@ def test_ihc_shards_rows_and_preserves_generation(
     modes = [("off", False), ("auto", False)]
     if kv_cache_dtype == "fp8_ds_mla":
         modes += [("auto", True), ("off", True)]
-    for hc_sp, use_shardq in modes:
+    for residual_sp, use_shardq in modes:
         with vllm_runner(
             str(tmp_path),
             load_format="dummy",
             skip_tokenizer_init=True,
             tensor_parallel_size=2,
-            hc_sequence_parallel=hc_sp,
+            residual_sequence_parallel=residual_sp,
             enable_expert_parallel=True,
             dtype="bfloat16",
             enforce_eager=enforce_eager,
@@ -119,7 +119,7 @@ def test_ihc_shards_rows_and_preserves_generation(
                     partial(
                         _check_ihc_rows,
                         min_tokens=1024,
-                        enabled=hc_sp == "auto",
+                        enabled=residual_sp == "auto",
                     )
                 )
             runs: list[CompletionOutput] = []
@@ -136,7 +136,7 @@ def test_ihc_shards_rows_and_preserves_generation(
                     any(shardq for _, _, shardq in rows) == use_shardq
                     for rows in observed
                 )
-                if hc_sp == "auto":
+                if residual_sp == "auto":
                     assert all(
                         any(
                             full > local and (shardq or not use_shardq)

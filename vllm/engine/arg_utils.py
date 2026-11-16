@@ -114,7 +114,6 @@ from vllm.config.parallel import (
     DCPCommBackend,
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
-    HCSequenceParallelMode,
 )
 from vllm.config.scheduler import SchedulerPolicy
 from vllm.config.utils import get_field
@@ -563,8 +562,10 @@ class EngineArgs:
     data_parallel_external_lb: bool = False
     data_parallel_multi_port_external_lb: bool = False
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
-    hc_sequence_parallel: HCSequenceParallelMode = ParallelConfig.hc_sequence_parallel
-    enable_hc_sp: bool | None = ParallelConfig.enable_hc_sp
+    residual_sequence_parallel: Literal["auto", "off"] = (
+        ParallelConfig.residual_sequence_parallel
+    )
+    enable_hc_sp: bool = ParallelConfig.enable_hc_sp
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     enable_batch_sharded_sampling: bool | None = (
         ParallelConfig.enable_batch_sharded_sampling
@@ -1328,7 +1329,8 @@ class EngineArgs:
             "a supervisor port.",
         )
         parallel_group.add_argument(
-            "--hc-sequence-parallel", **parallel_kwargs["hc_sequence_parallel"]
+            "--residual-sequence-parallel",
+            **parallel_kwargs["residual_sequence_parallel"],
         )
         parallel_group.add_argument("--enable-hc-sp", **parallel_kwargs["enable_hc_sp"])
         parallel_group.add_argument(
@@ -2642,7 +2644,7 @@ class EngineArgs:
             data_parallel_backend=self.data_parallel_backend,
             data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
             is_moe_model=model_config.is_moe,
-            hc_sequence_parallel=self.hc_sequence_parallel,
+            residual_sequence_parallel=self.residual_sequence_parallel,
             enable_hc_sp=self.enable_hc_sp,
             enable_expert_parallel=self.enable_expert_parallel,
             enable_batch_sharded_sampling=self.enable_batch_sharded_sampling,

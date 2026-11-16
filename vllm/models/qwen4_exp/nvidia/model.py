@@ -208,6 +208,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         self.config = config
         self.layer_type = layer_type
+        # MoE SP also enables HC SP, while HC SP can be enabled independently.
         self.use_hc_sequence_parallel = is_hc_sequence_parallel_enabled(vllm_config)
         self.layer_idx = extract_layer_index(prefix)
         self.use_sequence_parallel = (
@@ -351,9 +352,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states, attn_out, injection
         )
         if self.use_sequence_parallel:
-            mlp_out = self.mlp(
-                block_input, already_sequence_parallel=self.use_hc_sequence_parallel
-            )
+            # MoE consumes local tokens and returns complete local outputs.
+            mlp_out = self.mlp(block_input, already_sequence_parallel=True)
         else:
             if self.use_hc_sequence_parallel:
                 block_input = sp_all_gather(block_input)[: positions.shape[-1]]
@@ -428,6 +428,7 @@ class Qwen4ExpModel(nn.Module):
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
+        # MoE SP also enables HC SP, while HC SP can be enabled independently.
         self.use_hc_sequence_parallel = is_hc_sequence_parallel_enabled(vllm_config)
         self.use_sequence_parallel = (
             vllm_config.parallel_config.use_sequence_parallel_moe
@@ -553,16 +554,16 @@ class Qwen4ExpModel(nn.Module):
                 if input_ids is None:
                     raise ValueError("input_ids or inputs_embeds is required")
                 hidden_states = self.embed_input_ids(input_ids)
-            if (
-                self.use_sequence_parallel
-                and envs.VLLM_MOE_SKIP_PADDING
-                and is_forward_context_available()
-            ):
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
-                )
             if self.use_hc_sequence_parallel:
+                if (
+                    self.use_sequence_parallel
+                    and envs.VLLM_MOE_SKIP_PADDING
+                    and is_forward_context_available()
+                ):
+                    forward_context = get_forward_context()
+                    forward_context.is_padding = sp_padding_mask(
+                        forward_context.is_padding, hidden_states
+                    )
                 hidden_states = sp_shard(hidden_states)
             # Expand only the local token rows when SP is enabled.
             hidden_states = hidden_states.repeat(1, self.config.hc_count)

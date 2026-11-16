@@ -26,22 +26,17 @@ The `GPU KV cache size` line reports the total number of tokens that can be stor
 
 It's often advantageous to exploit the inherent parallelism of experts by using a separate parallelism strategy for the expert layers. vLLM supports large-scale deployment combining Data Parallel attention with Expert or Tensor Parallel MoE layers. For more information, see [Data Parallel Deployment](data_parallel_deployment.md).
 
-### HyperConnection sequence parallelism
+### Residual sequence parallelism
 
-`--hc-sequence-parallel auto` is the default. Supported models select
-token-sharded HyperConnection (HC) computation by topology and batch size.
-HY4 on CUDA selects iHC SP with TP>1, DP1/PP1/PCP1/DCP1 and at least 1024
-model token rows. Its existing LoRA, batch-invariance, auxiliary-hidden-state
-and MoE compatibility checks apply. Qwen4Exp on CUDA/ROCm selects HC SP
-with TP>1 and PP1, including TP-only deployments.
+`--residual-sequence-parallel auto` lets migrated models select token-sharded
+residual computation. The initial implementation is HY4 iHC on CUDA, with
+TP>1, DP1/PP1/PCP1/DCP1 and at least 1024 model token rows. Its LoRA,
+batch-invariance, auxiliary-hidden-state and MoE compatibility checks apply.
 
-Use `--hc-sequence-parallel off` to keep HC rows replicated. Models without
-HC ignore this option. Attention ShardQ and MoE SP have independent controls.
-
-The deprecated `--enable-hc-sp` option maps to `auto` and
-`--disable-hc-sp` maps to `off`. Explicit `off` takes precedence when both
-spellings are supplied. Python callers can use `hc_sequence_parallel`;
-the deprecated `enable_hc_sp=True/False` arguments follow the same mapping.
+Use `--residual-sequence-parallel off` to keep HY4 iHC rows replicated.
+Attention ShardQ and MoE dispatch determine their own layout requirements.
+This policy currently applies to HY4. Qwen4Exp uses its existing
+`--enable-hc-sp` and MoE-SP selection.
 
 ## Single-node deployment
 

@@ -16,6 +16,7 @@ import torch
 
 from vllm.distributed import (
     broadcast_tensor_dict,
+    cleanup_dist_env_and_memory,
     get_pp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -28,6 +29,7 @@ from vllm.distributed.parallel_state import (
     TensorMetadata,
     single_pp_stage,
 )
+from vllm.utils.network_utils import get_open_port
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 from ..utils import (
@@ -127,6 +129,41 @@ def all_gather_test_worker(
         t = all_tensors[rank % tp_size]
         t = tensor_model_parallel_all_gather(t, all_gather_dimension)
         torch.testing.assert_close(t, expected)
+
+
+def _residual_boundary_test_worker(
+    rank: int,
+    tp_size: int,
+    distributed_init_port: str,
+):
+    from vllm.models.common.ops.residual import ResidualBoundary
+
+    torch.accelerator.set_device_index(torch.device(f"cuda:{rank}"))
+    init_test_distributed_environment(tp_size, 1, rank, distributed_init_port)
+    base = torch.arange(1, 21, dtype=torch.float32, device="cuda").reshape(5, 4)
+    for partial in (False, True):
+        boundary = ResidualBoundary(output_is_partial=partial)
+        expected = base * tp_size + sum(range(tp_size)) if partial else base.clone()
+        for sharded in (False, True):
+            produced = base + rank if partial else base.clone()
+            result = boundary.complete_output(produced, sequence_parallel=sharded)
+            expected_rows = expected
+            if sharded:
+                padded = torch.nn.functional.pad(expected, (0, 0, 0, 1))
+                expected_rows = padded.chunk(tp_size)[rank]
+            torch.testing.assert_close(result, expected_rows, rtol=0, atol=0)
+            full = boundary.prepare_input(
+                result, num_tokens=5, sequence_parallel=sharded
+            )
+            torch.testing.assert_close(full, expected, rtol=0, atol=0)
+    cleanup_dist_env_and_memory()
+
+
+@multi_gpu_test(num_gpus=2)
+def test_residual_boundary_completes_partial_outputs_and_shards_complete_outputs():
+    torch.multiprocessing.spawn(
+        _residual_boundary_test_worker, args=(2, get_open_port()), nprocs=2
+    )
 
 
 @ray.remote(num_gpus=1, max_calls=1)
