@@ -4874,6 +4874,40 @@ def test_hc_sp_model_support(enabled, supported, cuda_alike, tp_size, pp_size, e
             ModelConfig.verify_with_parallel_config(model, parallel)
 
 
+def test_model_sp_policy_affects_compilation_hash():
+    configs = [
+        ParallelConfig(
+            model_sequence_parallel=mode,
+            tensor_parallel_size=2,
+            distributed_executor_backend="mp",
+        )
+        for mode in ("auto", "off")
+    ]
+    assert hash_config(configs[0]) != hash_config(configs[1])
+
+
+def test_model_sp_off_rejects_unmigrated_model(tmp_path):
+    from transformers import LlamaConfig
+
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        vocab_size=128,
+    ).save_pretrained(tmp_path)
+    model = ModelConfig(model=str(tmp_path), skip_tokenizer_init=True)
+    parallel = ParallelConfig(
+        model_sequence_parallel="off",
+        tensor_parallel_size=2,
+        distributed_executor_backend="mp",
+    )
+    with pytest.raises(ValueError, match="does not support --model-sequence-parallel"):
+        model.verify_with_parallel_config(parallel)
+
+
 @pytest.mark.parametrize(
     ("layer_types", "expected_attention"),
     [

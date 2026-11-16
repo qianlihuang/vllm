@@ -43,6 +43,7 @@ def get_min_num_redundant_experts(num_logical_experts: int, ep_size: int) -> int
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
+ModelSequenceParallelMode = Literal["auto", "off"]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 DBOSchedule = Literal["dispatch-combine-overlap", "all-reduce-overlap"]
@@ -208,6 +209,13 @@ class ParallelConfig:
     --data-parallel-start-rank."""
     is_moe_model: bool | None = None
     """Whether the deployed model is MoE (if known)."""
+    model_sequence_parallel: ModelSequenceParallelMode = "auto"
+    """Model-level token sharding policy. `auto` lets supported implementations
+    select residual and normalization layouts by topology and batch size.
+    `off` keeps that stream replicated. Initially implemented by HY4 on CUDA;
+    explicit `off` with TP>1 requires model support for this policy.
+    Attention ShardQ and expert dispatch retain their own configuration.
+    """
     enable_hc_sp: bool = False
     """Enable sequence parallelism for HyperConnection (HC) computation.
     Currently supported by Qwen4Exp on CUDA/ROCm with TP>1 and PP=1 (ignored when TP=1).

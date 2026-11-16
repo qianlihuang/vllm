@@ -49,7 +49,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_v2 import _try_load_fp8_indexer_wk
-from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    SupportsLoRA,
+    SupportsModelSP,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -272,7 +276,8 @@ class HYV4Model(nn.Module):
         self.enable_ihc = getattr(config, "enable_ihc", False)
         speculative_config = vllm_config.speculative_config
         use_sequence_parallel = (
-            self.enable_ihc
+            parallel_config.model_sequence_parallel == "auto"
+            and self.enable_ihc
             and parallel_config.tensor_parallel_size > 1
             and parallel_config.data_parallel_size == 1
             and parallel_config.pipeline_parallel_size == 1
@@ -309,12 +314,7 @@ class HYV4Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        self.shardq_sequence_parallel = use_sequence_parallel and all(
-            layer.defer_reduction for layer in self.layers
-        )
-        self.shardq_min_tokens = (
-            vllm_config.attention_config.sparse_mla_shard_q_min_tokens
-        )
+        self.use_sequence_parallel = use_sequence_parallel
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         else:
@@ -424,7 +424,7 @@ class HYV4Model(nn.Module):
     ) -> torch.Tensor | IntermediateTensors:
         full_num_tokens = positions.shape[0]
         use_sequence_parallel = is_sequence_parallel_active(
-            self.shardq_sequence_parallel, full_num_tokens, self.shardq_min_tokens
+            self.use_sequence_parallel, full_num_tokens, min_tokens=1024
         )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -674,7 +674,7 @@ class HYV4Model(nn.Module):
         return loaded_params
 
 
-class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsModelSP):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             ".q_a_proj": (".fused_qkv_a_proj", 0),

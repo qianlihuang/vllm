@@ -26,6 +26,19 @@ The `GPU KV cache size` line reports the total number of tokens that can be stor
 
 It's often advantageous to exploit the inherent parallelism of experts by using a separate parallelism strategy for the expert layers. vLLM supports large-scale deployment combining Data Parallel attention with Expert or Tensor Parallel MoE layers. For more information, see [Data Parallel Deployment](data_parallel_deployment.md).
 
+### Model-level sequence parallelism
+
+`--model-sequence-parallel auto` lets supported models select token-sharded
+residual and normalization computation by topology and batch size. HY4 on
+CUDA initially supports this policy and selects iHC SP with TP>1,
+DP1/PP1/PCP1/DCP1 and at least 1024 model token rows. The existing LoRA,
+batch-invariance, auxiliary-hidden-state and MoE compatibility checks apply.
+Attention ShardQ has its own eligibility and token threshold.
+
+Use `--model-sequence-parallel off` to keep the model stream replicated.
+With TP>1, explicit `off` requires an implementation supporting this policy.
+Expert dispatch continues to use its configured backend and layout.
+
 ## Single-node deployment
 
 vLLM supports distributed tensor-parallel and pipeline-parallel inference and serving. The implementation includes [Megatron-LM's tensor parallel algorithm](https://arxiv.org/pdf/1909.08053.pdf).
