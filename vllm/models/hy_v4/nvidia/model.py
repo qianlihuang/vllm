@@ -86,6 +86,8 @@ from .moe import HYV4FeedForward, HYV4MoEFused
 
 logger = init_logger(__name__)
 
+_MODEL_SP_MIN_TOKENS = 1024
+
 
 def _normalize_hyv4_config(config: PreTrainedConfig) -> PreTrainedConfig:
     """Populate the aliases consumed by the shared MoE implementation."""
@@ -424,7 +426,9 @@ class HYV4Model(nn.Module):
     ) -> torch.Tensor | IntermediateTensors:
         full_num_tokens = positions.shape[0]
         use_sequence_parallel = is_sequence_parallel_active(
-            self.use_sequence_parallel, full_num_tokens, min_tokens=1024
+            self.use_sequence_parallel,
+            full_num_tokens,
+            min_tokens=_MODEL_SP_MIN_TOKENS,
         )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
