@@ -16,6 +16,7 @@ import torch
 
 from vllm.distributed import (
     broadcast_tensor_dict,
+    cleanup_dist_env_and_memory,
     get_pp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -28,6 +29,7 @@ from vllm.distributed.parallel_state import (
     TensorMetadata,
     single_pp_stage,
 )
+from vllm.utils.network_utils import get_open_port
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 from ..utils import (
@@ -127,6 +129,89 @@ def all_gather_test_worker(
         t = all_tensors[rank % tp_size]
         t = tensor_model_parallel_all_gather(t, all_gather_dimension)
         torch.testing.assert_close(t, expected)
+
+
+def _check_sp_output_completion(rank: int, tp_size: int) -> None:
+    from vllm.models.common.ops.sequence_parallel import (
+        sp_all_gather,
+        sp_complete_output,
+    )
+
+    base = torch.arange(1, 21, dtype=torch.float32, device="cuda").reshape(5, 4)
+    for partial in (False, True):
+        expected = base * tp_size + sum(range(tp_size)) if partial else base.clone()
+        for sharded in (False, True):
+            produced = base + rank if partial else base.clone()
+            result = sp_complete_output(
+                produced, is_partial=partial, sequence_parallel=sharded
+            )
+            expected_rows = expected
+            if sharded:
+                padded = torch.nn.functional.pad(expected, (0, 0, 0, 1))
+                expected_rows = padded.chunk(tp_size)[rank]
+            torch.testing.assert_close(result, expected_rows, rtol=0, atol=0)
+            full = sp_all_gather(result)[:5] if sharded else result
+            torch.testing.assert_close(full, expected, rtol=0, atol=0)
+            if not partial and not sharded:
+                assert result is produced
+
+
+def _check_sp_packed_gather(rank: int, tp_size: int) -> None:
+    from vllm.models.common.ops.sequence_parallel import sp_all_gather_packed
+
+    hidden = torch.arange(24, dtype=torch.float32, device="cuda").reshape(6, 4)
+    aux = torch.arange(72, dtype=torch.float32, device="cuda").reshape(6, 12) + 100
+    hidden_shard = hidden.chunk(tp_size)[rank]
+    aux_shard = aux.chunk(tp_size)[rank]
+    gathered = sp_all_gather_packed([hidden_shard, aux_shard], num_tokens=5)
+    torch.testing.assert_close(gathered[0], hidden[:5], rtol=0, atol=0)
+    torch.testing.assert_close(gathered[1], aux[:5], rtol=0, atol=0)
+    (single,) = sp_all_gather_packed([hidden_shard], num_tokens=5)
+    torch.testing.assert_close(single, hidden[:5], rtol=0, atol=0)
+
+
+def _check_sp_forward_padding(rank: int, tp_size: int) -> None:
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.common.ops.sequence_parallel import sp_shard_forward_padding
+
+    rows = torch.empty(5, 4, device="cuda")
+    padding = torch.tensor([False, True, False, False, True], device="cuda")
+    expected = torch.nn.functional.pad(padding, (0, 1), value=True).chunk(tp_size)
+    for enabled in (False, True):
+        context = ForwardContext({}, {}, {}, is_padding=padding)
+        with (
+            pytest.MonkeyPatch.context() as patch,
+            override_forward_context(context),
+        ):
+            patch.setenv("VLLM_MOE_SKIP_PADDING", str(int(enabled)))
+            sp_shard_forward_padding(rows)
+        if enabled:
+            torch.testing.assert_close(context.is_padding, expected[rank])
+        else:
+            assert context.is_padding is padding
+
+
+def _sp_boundary_test_worker(
+    rank: int, tp_size: int, distributed_init_port: str, check: Callable
+) -> None:
+    torch.accelerator.set_device_index(torch.device(f"cuda:{rank}"))
+    init_test_distributed_environment(tp_size, 1, rank, distributed_init_port)
+    try:
+        check(rank, tp_size)
+    finally:
+        cleanup_dist_env_and_memory()
+
+
+@pytest.mark.parametrize(
+    "check",
+    [_check_sp_output_completion, _check_sp_packed_gather, _check_sp_forward_padding],
+    ids=["output_completion", "packed_gather", "forward_padding"],
+)
+@multi_gpu_test(num_gpus=2)
+def test_sequence_parallel_boundaries_use_real_tp_collectives(check: Callable):
+    torch.multiprocessing.spawn(
+        _sp_boundary_test_worker, args=(2, get_open_port(), check), nprocs=2
+    )
 
 
 @ray.remote(num_gpus=1, max_calls=1)
