@@ -208,6 +208,12 @@ class ParallelConfig:
     --data-parallel-start-rank."""
     is_moe_model: bool | None = None
     """Whether the deployed model is MoE (if known)."""
+    residual_sequence_parallel: Literal["auto", "off"] = "auto"
+    """Select optional token sharding for migrated residual implementations.
+    HY4 on CUDA supports `auto` with model-specific topology and token-count
+    checks. `off` keeps its iHC rows replicated. Attention ShardQ and MoE
+    dispatch have independent layout requirements.
+    """
     enable_hc_sp: bool = False
     """Enable sequence parallelism for HyperConnection (HC) computation.
     Currently supported by Qwen4Exp on CUDA/ROCm with TP>1 and PP=1 (ignored when TP=1).

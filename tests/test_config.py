@@ -2581,13 +2581,15 @@ def test_dspark_draft_eplb_rejects_elastic_ep_unless_disabled(
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("target_ep", [False, True], ids=["ep-off", "ep-on"])
 @pytest.mark.parametrize("pass_none", [False, True], ids=["omitted", "explicit-none"])
+@pytest.mark.parametrize("residual_mode", ["auto", "off"])
 def test_draft_parallel_config_preserves_ep_without_model(
-    target_ep: bool, pass_none: bool
+    target_ep: bool, pass_none: bool, residual_mode: str
 ):
-    """Legacy callers without draft model information keep EP inheritance."""
+    """Drafts inherit EP and residual policy when model metadata is absent."""
     target_parallel_config = ParallelConfig(
         tensor_parallel_size=2,
         enable_expert_parallel=target_ep,
+        residual_sequence_parallel=residual_mode,
         distributed_executor_backend="mp",
     )
     if pass_none:
@@ -2601,6 +2603,7 @@ def test_draft_parallel_config_preserves_ep_without_model(
 
     assert draft_parallel_config.enable_expert_parallel is target_ep
     assert draft_parallel_config.tensor_parallel_size == 2
+    assert draft_parallel_config.residual_sequence_parallel == residual_mode
     assert target_parallel_config.enable_expert_parallel is target_ep
 
 
@@ -4872,6 +4875,43 @@ def test_hc_sp_model_support(enabled, supported, cuda_alike, tp_size, pp_size, e
                 ModelConfig.verify_with_parallel_config(model, parallel)
         else:
             ModelConfig.verify_with_parallel_config(model, parallel)
+
+
+def test_residual_sp_policy_affects_compilation_hash():
+    configs = [
+        ParallelConfig(
+            residual_sequence_parallel=mode,
+            tensor_parallel_size=2,
+            distributed_executor_backend="mp",
+        )
+        for mode in ("auto", "off")
+    ]
+    assert hash_config(configs[0]) != hash_config(configs[1])
+
+
+@pytest.mark.parametrize(
+    "explicit_hc,moe_sp", [(False, False), (True, False), (False, True)]
+)
+@pytest.mark.parametrize("residual_mode", ["auto", "off"])
+def test_residual_boundary_rollout_preserves_qwen_hc_selection(
+    explicit_hc, moe_sp, residual_mode
+):
+    from vllm.models.qwen4_exp.common.hyperconnection import (
+        is_hc_sequence_parallel_enabled,
+    )
+
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            data_parallel_size=2 if moe_sp else 1,
+            enable_expert_parallel=moe_sp,
+            enable_hc_sp=explicit_hc,
+            residual_sequence_parallel=residual_mode,
+            all2all_backend="allgather_reducescatter",
+            distributed_executor_backend="mp",
+        )
+    )
+    assert is_hc_sequence_parallel_enabled(config) is (explicit_hc or moe_sp)
 
 
 @pytest.mark.parametrize(

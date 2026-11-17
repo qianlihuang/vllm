@@ -562,6 +562,9 @@ class EngineArgs:
     data_parallel_external_lb: bool = False
     data_parallel_multi_port_external_lb: bool = False
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
+    residual_sequence_parallel: Literal["auto", "off"] = (
+        ParallelConfig.residual_sequence_parallel
+    )
     enable_hc_sp: bool = ParallelConfig.enable_hc_sp
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     enable_batch_sharded_sampling: bool | None = (
@@ -1324,6 +1327,10 @@ class EngineArgs:
             help="Run a node-local supervisor that launches one external-LB API "
             "server per local data parallel rank and exposes aggregated health on "
             "a supervisor port.",
+        )
+        parallel_group.add_argument(
+            "--residual-sequence-parallel",
+            **parallel_kwargs["residual_sequence_parallel"],
         )
         parallel_group.add_argument("--enable-hc-sp", **parallel_kwargs["enable_hc_sp"])
         parallel_group.add_argument(
@@ -2637,6 +2644,7 @@ class EngineArgs:
             data_parallel_backend=self.data_parallel_backend,
             data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
             is_moe_model=model_config.is_moe,
+            residual_sequence_parallel=self.residual_sequence_parallel,
             enable_hc_sp=self.enable_hc_sp,
             enable_expert_parallel=self.enable_expert_parallel,
             enable_batch_sharded_sampling=self.enable_batch_sharded_sampling,

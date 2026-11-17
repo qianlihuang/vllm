@@ -13,6 +13,7 @@ steps:
   - vllm/distributed
   - "!vllm/distributed/kv_transfer/"
   - tests/distributed
+  - vllm/models/common/ops/residual.py
   commands:
   - pytest -v -s distributed/test_localization.py
   - pytest -v -s distributed/test_comm_ops.py
@@ -35,6 +36,7 @@ steps:
       source_file_dependencies:
       - vllm/distributed
       - tests/distributed
+      - vllm/models/common/ops/residual.py
       - vllm/platforms/rocm.py
       commands:
       - pytest -v -s distributed/test_comm_ops.py
@@ -571,6 +573,7 @@ steps:
   - vllm/models/hy_v4/nvidia/model.py
   - vllm/models/hy_v4/nvidia/moe.py
   - vllm/models/common/ops/sequence_parallel.py
+  - vllm/models/common/ops/residual.py
   - vllm/model_executor/layers/attention/
   - vllm/model_executor/models/deepseek_v2.py
   - vllm/v1/attention/ops/shardq.py

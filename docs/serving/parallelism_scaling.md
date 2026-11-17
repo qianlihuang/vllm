@@ -26,6 +26,18 @@ The `GPU KV cache size` line reports the total number of tokens that can be stor
 
 It's often advantageous to exploit the inherent parallelism of experts by using a separate parallelism strategy for the expert layers. vLLM supports large-scale deployment combining Data Parallel attention with Expert or Tensor Parallel MoE layers. For more information, see [Data Parallel Deployment](data_parallel_deployment.md).
 
+### Residual sequence parallelism
+
+`--residual-sequence-parallel auto` lets migrated models select token-sharded
+residual computation. The initial implementation is HY4 iHC on CUDA, with
+TP>1, DP1/PP1/PCP1/DCP1 and at least 1024 model token rows. Its LoRA,
+batch-invariance, auxiliary-hidden-state and MoE compatibility checks apply.
+
+Use `--residual-sequence-parallel off` to keep HY4 iHC rows replicated.
+Attention ShardQ and MoE dispatch determine their own layout requirements.
+This policy currently applies to HY4. Qwen4Exp uses its existing
+`--enable-hc-sp` and MoE-SP selection.
+
 ## Single-node deployment
 
 vLLM supports distributed tensor-parallel and pipeline-parallel inference and serving. The implementation includes [Megatron-LM's tensor parallel algorithm](https://arxiv.org/pdf/1909.08053.pdf).

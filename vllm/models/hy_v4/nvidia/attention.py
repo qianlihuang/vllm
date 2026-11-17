@@ -472,7 +472,7 @@ class HYV4MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            reduce_results=not (sequence_parallel and self.mla_attn.use_shardq),
+            reduce_results=not sequence_parallel,
         )
 
     @property
