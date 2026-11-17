@@ -67,7 +67,10 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
-from vllm.models.common.ops.sequence_parallel import sp_all_gather
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_all_gather_packed,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
@@ -585,15 +588,8 @@ class Qwen4ExpModel(nn.Module):
         if self.use_hc_sequence_parallel:
             if self._mtp_hidden_buffer is not None:
                 # Gather LM-head and MTP states together when both are needed.
-                hidden_size = self.config.hidden_size
-                packed_hidden_states = torch.cat(
-                    [sample_hidden_states, multi_hidden], dim=-1
-                )
-                packed_hidden_states = sp_all_gather(packed_hidden_states)[
-                    :full_num_tokens
-                ]
-                sample_hidden_states, multi_hidden = packed_hidden_states.split(
-                    [hidden_size, self.config.hc_count * hidden_size], dim=-1
+                sample_hidden_states, multi_hidden = sp_all_gather_packed(
+                    [sample_hidden_states, multi_hidden], full_num_tokens
                 )
                 sample_hidden_states = sample_hidden_states.contiguous()
             else:

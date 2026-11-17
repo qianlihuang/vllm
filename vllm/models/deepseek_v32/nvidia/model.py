@@ -41,6 +41,7 @@ from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_
 from vllm.models.common.ops.sequence_parallel import (
     is_sequence_parallel_active,
     sp_all_gather,
+    sp_all_gather_packed,
     sp_reduce_scatter,
     sp_shard,
     sp_shard_forward_padding,
@@ -332,18 +333,9 @@ class DeepseekV32Model(torch.nn.Module):
 
         if use_sequence_parallel:
             hidden_states, _ = self.norm(hidden_states, residual)
-            if aux_hidden_states:
-                hidden_size = hidden_states.shape[-1]
-                packed_hidden_states = torch.cat(
-                    [hidden_states, *aux_hidden_states], dim=-1
-                )
-                packed_hidden_states = sp_all_gather(packed_hidden_states)
-                packed_hidden_states = packed_hidden_states[:full_num_tokens]
-                hidden_states, *aux_hidden_states = packed_hidden_states.split(
-                    hidden_size, dim=-1
-                )
-            else:
-                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+            hidden_states, *aux_hidden_states = sp_all_gather_packed(
+                [hidden_states, *aux_hidden_states], full_num_tokens
+            )
         else:
             hidden_states, _ = fused_allreduce_rms_norm(
                 hidden_states, residual, self.norm

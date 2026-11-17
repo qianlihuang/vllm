@@ -41,7 +41,10 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
-from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather_packed,
+    sp_shard,
+)
 from vllm.sequence import IntermediateTensors
 
 from ..common.hyperconnection import is_hc_sequence_parallel_enabled
@@ -353,12 +356,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         )
         if self.use_hc_sequence_parallel:
             # Gather both outputs together, then restore their contiguous layouts.
-            packed_hidden_states = torch.cat(
-                [sample_hidden_states, multi_hidden], dim=-1
-            )
-            packed_hidden_states = sp_all_gather(packed_hidden_states)[:full_num_tokens]
-            sample_hidden_states, multi_hidden = packed_hidden_states.split(
-                [hidden_size, hc_count * hidden_size], dim=-1
+            sample_hidden_states, multi_hidden = sp_all_gather_packed(
+                [sample_hidden_states, multi_hidden], full_num_tokens
             )
             sample_hidden_states = sample_hidden_states.contiguous()
             multi_hidden = multi_hidden.contiguous()

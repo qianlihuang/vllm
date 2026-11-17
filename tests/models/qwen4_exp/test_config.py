@@ -140,7 +140,11 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams(
 
     with (
         patch(f"{mtp_module}.sp_shard", side_effect=lambda x: x[:2]),
-        patch(f"{mtp_module}.sp_all_gather", side_effect=gather),
+        # The MTP gathers both outputs through the shared packed helper.
+        patch(
+            "vllm.models.common.ops.sequence_parallel.sp_all_gather",
+            side_effect=gather,
+        ),
         # The fused norm kernel is CUDA-only; it has dedicated kernel tests.
         (
             patch(
