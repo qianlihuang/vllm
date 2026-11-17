@@ -34,10 +34,7 @@ from transformers import PreTrainedConfig
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
-)
+from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -64,7 +61,7 @@ from vllm.model_executor.models.utils import (
 from vllm.models.common.ops.sequence_parallel import (
     is_sequence_parallel_active,
     sp_all_gather,
-    sp_reduce_scatter,
+    sp_complete_output,
     sp_shard,
 )
 from vllm.platforms import current_platform
@@ -218,12 +215,11 @@ class HYV4DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
-        if self.defer_reduction:
-            hidden_states = (
-                sp_reduce_scatter(hidden_states)
-                if use_ihc_sequence_parallel
-                else tensor_model_parallel_all_reduce(hidden_states)
-            )
+        hidden_states = sp_complete_output(
+            hidden_states,
+            is_partial=self.defer_reduction,
+            sequence_parallel=use_ihc_sequence_parallel,
+        )
         hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
 
         hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
@@ -232,12 +228,11 @@ class HYV4DecoderLayer(nn.Module):
         if use_ihc_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self.mlp(hidden_states)
-        if self.defer_reduction:
-            hidden_states = (
-                sp_reduce_scatter(hidden_states)
-                if use_ihc_sequence_parallel
-                else tensor_model_parallel_all_reduce(hidden_states)
-            )
+        hidden_states = sp_complete_output(
+            hidden_states,
+            is_partial=self.defer_reduction,
+            sequence_parallel=use_ihc_sequence_parallel,
+        )
         hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post_gates)
 
         # Under iHC the residual is carried inside hidden_states.

@@ -70,6 +70,7 @@ from vllm.model_executor.models.utils import (
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_all_gather_packed,
+    sp_complete_output,
     sp_reduce_scatter,
     sp_shard,
     sp_shard_forward_padding,
@@ -359,10 +360,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             mlp_out = self.mlp(block_input)
             if self.use_hc_sequence_parallel:
                 assert isinstance(self.mlp, Qwen4ExpSparseMoeBlock)
-                reduce_output = self.mlp.experts.moe_config.skip_final_all_reduce
                 # Only sum partial outputs. Reduced outputs already include all ranks.
-                mlp_out = (
-                    sp_reduce_scatter(mlp_out) if reduce_output else sp_shard(mlp_out)
+                mlp_out = sp_complete_output(
+                    mlp_out,
+                    is_partial=self.mlp.experts.moe_config.skip_final_all_reduce,
+                    sequence_parallel=True,
                 )
         return hidden_states, mlp_out, injection
 
