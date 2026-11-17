@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Sequence
 from functools import lru_cache
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 
 
 def _custom_collective(name: str, x: torch.Tensor) -> torch.Tensor | None:
@@ -41,6 +45,21 @@ def sp_all_gather(x: torch.Tensor) -> torch.Tensor:
     if output is not None:
         return output
     return tensor_model_parallel_all_gather(x, 0)
+
+
+def sp_all_gather_packed(
+    tensors: Sequence[torch.Tensor], num_tokens: int
+) -> list[torch.Tensor]:
+    """All-gather several shards of the same token rows with one collective.
+
+    The shards are concatenated along the last dimension, gathered, trimmed to
+    `num_tokens` rows and split back, so the results share one buffer.
+    """
+    if len(tensors) == 1:
+        return [sp_all_gather(tensors[0])[:num_tokens]]
+    widths = [tensor.shape[-1] for tensor in tensors]
+    packed = sp_all_gather(torch.cat(tuple(tensors), dim=-1))[:num_tokens]
+    return list(packed.split(widths, dim=-1))
 
 
 # Below this many tokens per rank the pipelined copy-engine all-gather costs
@@ -118,3 +137,33 @@ def sp_padding_mask(
     chunk = is_padding.shape[0] // tp_size
     tp_rank = get_tensor_model_parallel_rank()
     return is_padding[tp_rank * chunk : (tp_rank + 1) * chunk]
+
+
+def sp_shard_forward_padding(hidden_states: torch.Tensor) -> None:
+    """Hand MoE this rank's shard of the forward context's padding mask.
+
+    Call it with the full token rows, before `sp_shard`. Without a forward
+    context, or with `VLLM_MOE_SKIP_PADDING=0`, the mask is left alone.
+    """
+    if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+        forward_context = get_forward_context()
+        forward_context.is_padding = sp_padding_mask(
+            forward_context.is_padding, hidden_states
+        )
+
+
+def sp_complete_output(
+    x: torch.Tensor, *, is_partial: bool, sequence_parallel: bool
+) -> torch.Tensor:
+    """Finish a full-row TP output on the token rows of the residual stream.
+
+    A partial output is this rank's addend of a sum over the TP group. Exactly
+    one call completes it: a reduce-scatter onto token shards, or an all-reduce
+    onto replicated rows. A complete output is cut to this rank's shard, or
+    used as it is.
+    """
+    if is_partial:
+        if sequence_parallel:
+            return sp_reduce_scatter(x)
+        return tensor_model_parallel_all_reduce(x)
+    return sp_shard(x) if sequence_parallel else x
