@@ -9,11 +9,9 @@ import torch
 from torch import nn
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import get_pp_group
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -71,9 +69,9 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
-    sp_padding_mask,
     sp_reduce_scatter,
     sp_shard,
+    sp_shard_forward_padding,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -555,15 +553,8 @@ class Qwen4ExpModel(nn.Module):
                     raise ValueError("input_ids or inputs_embeds is required")
                 hidden_states = self.embed_input_ids(input_ids)
             if self.use_hc_sequence_parallel:
-                if (
-                    self.use_sequence_parallel
-                    and envs.VLLM_MOE_SKIP_PADDING
-                    and is_forward_context_available()
-                ):
-                    forward_context = get_forward_context()
-                    forward_context.is_padding = sp_padding_mask(
-                        forward_context.is_padding, hidden_states
-                    )
+                if self.use_sequence_parallel:
+                    sp_shard_forward_padding(hidden_states)
                 hidden_states = sp_shard(hidden_states)
             # Expand only the local token rows when SP is enabled.
             hidden_states = hidden_states.repeat(1, self.config.hc_count)
