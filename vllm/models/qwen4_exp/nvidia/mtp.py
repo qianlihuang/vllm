@@ -20,9 +20,7 @@ import torch
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 
-from vllm import envs
 from vllm.config import VllmConfig, replace, set_current_vllm_config
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.kernels.triton.fused_pre_fc_norms import fused_pre_fc_norms_split
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -44,9 +42,9 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
+    sp_all_gather_packed,
     sp_shard,
+    sp_shard_forward_padding,
 )
 from vllm.sequence import IntermediateTensors
 
@@ -343,15 +341,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         current_step_idx = spec_step_idx % self.num_mtp_layers
         full_num_tokens = positions.shape[-1]
         if self.use_hc_sequence_parallel:
-            if (
-                self.use_sequence_parallel
-                and envs.VLLM_MOE_SKIP_PADDING
-                and is_forward_context_available()
-            ):
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
-                )
+            if self.use_sequence_parallel:
+                sp_shard_forward_padding(hidden_states)
             hidden_states = sp_shard(hidden_states)
             # The FC output is already complete and needs only a slice.
             prev_block_output = sp_shard(prev_block_output)
@@ -377,12 +368,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         )
         if self.use_hc_sequence_parallel:
             # Gather both outputs together, then restore their contiguous layouts.
-            packed_hidden_states = torch.cat(
-                [sample_hidden_states, multi_hidden], dim=-1
-            )
-            packed_hidden_states = sp_all_gather(packed_hidden_states)[:full_num_tokens]
-            sample_hidden_states, multi_hidden = packed_hidden_states.split(
-                [hidden_size, hc_count * hidden_size], dim=-1
+            sample_hidden_states, multi_hidden = sp_all_gather_packed(
+                [sample_hidden_states, multi_hidden], full_num_tokens
             )
             sample_hidden_states = sample_hidden_states.contiguous()
             multi_hidden = multi_hidden.contiguous()

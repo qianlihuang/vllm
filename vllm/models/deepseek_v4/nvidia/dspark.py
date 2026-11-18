@@ -15,9 +15,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
@@ -44,8 +42,8 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import extract_layer_index, maybe_prefix
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
-    sp_padding_mask,
     sp_shard,
+    sp_shard_forward_padding,
 )
 from vllm.models.deepseek_v4.common.eplb_util import collect_moe_layers
 from vllm.models.deepseek_v4.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
@@ -231,11 +229,7 @@ class DSparkDeepseekV4Model(nn.Module):
             inputs_embeds = self.embed_input_ids(input_ids)
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, inputs_embeds
-                )
+            sp_shard_forward_padding(inputs_embeds)
             inputs_embeds = sp_shard(inputs_embeds)
             input_ids = sp_shard(input_ids)
         mega_gate_metadata = None

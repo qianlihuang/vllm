@@ -138,9 +138,15 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams(
         remote = torch.cat([expected_sample[2:], multi_hidden[2:]], dim=-1)
         return torch.cat([local, remote, torch.full_like(remote, float("nan"))])
 
+    # The NVIDIA MTP gathers both outputs through the shared packed helper.
+    gather_owner = (
+        "vllm.models.common.ops.sequence_parallel"
+        if backend == "nvidia"
+        else mtp_module
+    )
     with (
         patch(f"{mtp_module}.sp_shard", side_effect=lambda x: x[:2]),
-        patch(f"{mtp_module}.sp_all_gather", side_effect=gather),
+        patch(f"{gather_owner}.sp_all_gather", side_effect=gather),
         # The fused norm kernel is CUDA-only; it has dedicated kernel tests.
         (
             patch(

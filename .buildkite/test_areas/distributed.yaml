@@ -12,6 +12,7 @@ steps:
   source_file_dependencies:
   - vllm/distributed
   - vllm/v1/attention/ops/cp_common.py
+  - vllm/models/common/ops/sequence_parallel.py
   - "!vllm/distributed/kv_transfer/"
   - tests/distributed
   commands:
@@ -38,6 +39,7 @@ steps:
       - vllm/distributed
       - tests/distributed
       - vllm/platforms/rocm.py
+      - vllm/models/common/ops/sequence_parallel.py
       commands:
       - pytest -v -s distributed/test_comm_ops.py
       - pytest -v -s distributed/test_cpu_all_reduce.py

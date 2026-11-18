@@ -70,9 +70,9 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
-    sp_padding_mask,
     sp_reduce_scatter,
     sp_shard,
+    sp_shard_forward_padding,
 )
 from vllm.models.deepseek_v4.common.spec_decode import needs_mtp_hidden_buffer
 from vllm.models.deepseek_v4.nvidia.model import (
@@ -1286,11 +1286,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
-                )
+            sp_shard_forward_padding(hidden_states)
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
 

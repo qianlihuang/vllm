@@ -18,9 +18,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
@@ -41,8 +39,8 @@ from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weigh
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
-    sp_padding_mask,
     sp_shard,
+    sp_shard_forward_padding,
 )
 from vllm.models.deepseek_v4.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from vllm.models.deepseek_v4.common.ops.fused_mtp_input_rmsnorm import (
@@ -168,11 +166,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             self.hc_mult,
         )
         if self.mtp_block.use_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, inputs_embeds
-                )
+            sp_shard_forward_padding(inputs_embeds)
             inputs_embeds = sp_shard(inputs_embeds)
             previous_hidden_states = sp_shard(previous_hidden_states)
         hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
