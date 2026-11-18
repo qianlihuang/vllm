@@ -9,7 +9,6 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_embed_norm import (
     fused_embed_norm,
     has_full_vocab_on_rank,
@@ -42,9 +41,10 @@ from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_
 from vllm.models.common.ops.sequence_parallel import (
     is_sequence_parallel_active,
     sp_all_gather,
-    sp_padding_mask,
+    sp_all_gather_packed,
     sp_reduce_scatter,
     sp_shard,
+    sp_shard_forward_padding,
 )
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
 from vllm.sequence import IntermediateTensors
@@ -297,15 +297,8 @@ class DeepseekV32Model(torch.nn.Module):
         residual = None
 
         if use_sequence_parallel:
-            if (
-                self.use_sequence_parallel
-                and envs.VLLM_MOE_SKIP_PADDING
-                and is_forward_context_available()
-            ):
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
-                )
+            if self.use_sequence_parallel:
+                sp_shard_forward_padding(hidden_states)
             hidden_states = sp_shard(hidden_states)
             if attn_in is not None:
                 attn_in = sp_shard(attn_in)
@@ -340,18 +333,9 @@ class DeepseekV32Model(torch.nn.Module):
 
         if use_sequence_parallel:
             hidden_states, _ = self.norm(hidden_states, residual)
-            if aux_hidden_states:
-                hidden_size = hidden_states.shape[-1]
-                packed_hidden_states = torch.cat(
-                    [hidden_states, *aux_hidden_states], dim=-1
-                )
-                packed_hidden_states = sp_all_gather(packed_hidden_states)
-                packed_hidden_states = packed_hidden_states[:full_num_tokens]
-                hidden_states, *aux_hidden_states = packed_hidden_states.split(
-                    hidden_size, dim=-1
-                )
-            else:
-                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+            hidden_states, *aux_hidden_states = sp_all_gather_packed(
+                [hidden_states, *aux_hidden_states], full_num_tokens
+            )
         else:
             hidden_states, _ = fused_allreduce_rms_norm(
                 hidden_states, residual, self.norm

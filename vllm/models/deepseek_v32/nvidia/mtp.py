@@ -6,9 +6,7 @@ from collections.abc import Callable, Iterable
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_embed_norm import (
     fused_embed_eh_norm,
     has_full_vocab_on_rank,
@@ -37,8 +35,8 @@ from vllm.model_executor.models.utils import (
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
-    sp_padding_mask,
     sp_shard,
+    sp_shard_forward_padding,
 )
 from vllm.models.deepseek_v32.common.kernels import fused_eh_norm
 from vllm.platforms import current_platform
@@ -130,11 +128,7 @@ class DeepseekV32MultiTokenPredictorLayer(nn.Module):
             )
         is_sequence_parallel = self.mtp_block.use_sequence_parallel
         if is_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, eh_input
-                )
+            sp_shard_forward_padding(eh_input)
             eh_input = sp_shard(eh_input)
         hidden_states = run_glm52_plan(self._eh_plan, eh_input, self.eh_proj.weight)
         if hidden_states is None:

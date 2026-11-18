@@ -8,9 +8,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -30,8 +28,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import get_pp_missing_layer_names, maybe_prefix
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
-    sp_padding_mask,
     sp_shard,
+    sp_shard_forward_padding,
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -125,11 +123,7 @@ class KimiK3MultiTokenPredictorLayer(nn.Module):
             )
         )
         if self.mtp_block.use_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
-                )
+            sp_shard_forward_padding(hidden_states)
             hidden_states = sp_shard(hidden_states)
 
         hidden_states, _, residual = self.mtp_block(

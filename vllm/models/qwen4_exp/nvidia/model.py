@@ -9,11 +9,9 @@ import torch
 from torch import nn
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import get_pp_group
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -71,9 +69,11 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
-    sp_padding_mask,
+    sp_all_gather_packed,
+    sp_complete_output,
     sp_reduce_scatter,
     sp_shard,
+    sp_shard_forward_padding,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -360,10 +360,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             mlp_out = self.mlp(block_input)
             if self.use_hc_sequence_parallel:
                 assert isinstance(self.mlp, Qwen4ExpSparseMoeBlock)
-                reduce_output = self.mlp.experts.moe_config.skip_final_all_reduce
                 # Only sum partial outputs. Reduced outputs already include all ranks.
-                mlp_out = (
-                    sp_reduce_scatter(mlp_out) if reduce_output else sp_shard(mlp_out)
+                mlp_out = sp_complete_output(
+                    mlp_out,
+                    is_partial=self.mlp.experts.moe_config.skip_final_all_reduce,
+                    sequence_parallel=True,
                 )
         return hidden_states, mlp_out, injection
 
@@ -555,15 +556,8 @@ class Qwen4ExpModel(nn.Module):
                     raise ValueError("input_ids or inputs_embeds is required")
                 hidden_states = self.embed_input_ids(input_ids)
             if self.use_hc_sequence_parallel:
-                if (
-                    self.use_sequence_parallel
-                    and envs.VLLM_MOE_SKIP_PADDING
-                    and is_forward_context_available()
-                ):
-                    forward_context = get_forward_context()
-                    forward_context.is_padding = sp_padding_mask(
-                        forward_context.is_padding, hidden_states
-                    )
+                if self.use_sequence_parallel:
+                    sp_shard_forward_padding(hidden_states)
                 hidden_states = sp_shard(hidden_states)
             # Expand only the local token rows when SP is enabled.
             hidden_states = hidden_states.repeat(1, self.config.hc_count)
@@ -648,15 +642,8 @@ class Qwen4ExpModel(nn.Module):
         if self.use_hc_sequence_parallel:
             if self._mtp_hidden_buffer is not None:
                 # Gather LM-head and MTP states together when both are needed.
-                hidden_size = self.config.hidden_size
-                packed_hidden_states = torch.cat(
-                    [sample_hidden_states, multi_hidden], dim=-1
-                )
-                packed_hidden_states = sp_all_gather(packed_hidden_states)[
-                    :full_num_tokens
-                ]
-                sample_hidden_states, multi_hidden = packed_hidden_states.split(
-                    [hidden_size, self.config.hc_count * hidden_size], dim=-1
+                sample_hidden_states, multi_hidden = sp_all_gather_packed(
+                    [sample_hidden_states, multi_hidden], full_num_tokens
                 )
                 sample_hidden_states = sample_hidden_states.contiguous()
             else:

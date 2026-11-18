@@ -107,6 +107,7 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
+    sp_all_gather_packed,
     sp_padding_mask,
     sp_reduce_scatter,
     sp_shard,
@@ -1616,11 +1617,8 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             )
             if self.use_sequence_parallel:
                 # PP transport expects tensors replicated across TP ranks.
-                hidden_size = hidden_states.shape[-1]
-                packed = torch.cat([hidden_states, residual, *aux_hidden_states], -1)
-                packed = sp_all_gather(packed)[:num_tokens]
-                hidden_states, residual, *aux_hidden_states = packed.split(
-                    hidden_size, dim=-1
+                hidden_states, residual, *aux_hidden_states = sp_all_gather_packed(
+                    [hidden_states, residual, *aux_hidden_states], num_tokens
                 )
             return IntermediateTensors(
                 {
@@ -1639,14 +1637,11 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         if self.end_layer in self.aux_hidden_state_layers:
             aux_hidden_states.append(residual.clone())
 
-        if self.use_sequence_parallel and aux_hidden_states:
+        if self.use_sequence_parallel:
             # One all-gather for the output and every aux hidden state.
-            hidden_size = hidden_states.shape[-1]
-            packed = torch.cat([hidden_states, *aux_hidden_states], dim=-1)
-            packed = sp_all_gather(packed)[:num_tokens]
-            hidden_states, *aux_hidden_states = packed.split(hidden_size, dim=-1)
-        elif self.use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)[:num_tokens]
+            hidden_states, *aux_hidden_states = sp_all_gather_packed(
+                [hidden_states, *aux_hidden_states], num_tokens
+            )
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states

@@ -16,7 +16,6 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
 from vllm.model_executor.layers.fused_moe import (
@@ -94,9 +93,10 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
-    sp_padding_mask,
+    sp_all_gather_packed,
     sp_reduce_scatter,
     sp_shard,
+    sp_shard_forward_padding,
 )
 from vllm.models.kimi_k3.common.dsa_cache import packed_dsa_block_size
 from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
@@ -1209,11 +1209,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
-                )
+            sp_shard_forward_padding(hidden_states)
             hidden_states = sp_shard(hidden_states)
             assert residual is None, "Currently, SP is not supported with PP"
 
@@ -1298,19 +1294,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             hidden_states = hidden_states + residual
 
         if self.use_sequence_parallel:
-            if aux_hidden_states:
-                hidden_size = hidden_states.shape[-1]
-                packed_hidden_states = torch.cat(
-                    [hidden_states, *aux_hidden_states], dim=-1
-                )
-                packed_hidden_states = sp_all_gather(packed_hidden_states)
-                packed_hidden_states = packed_hidden_states[:full_num_tokens]
-                hidden_states, *aux_hidden_states = packed_hidden_states.split(
-                    hidden_size, dim=-1
-                )
-            else:
-                hidden_states = sp_all_gather(hidden_states)
-                hidden_states = hidden_states[:full_num_tokens]
+            hidden_states, *aux_hidden_states = sp_all_gather_packed(
+                [hidden_states, *aux_hidden_states], full_num_tokens
+            )
 
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.
