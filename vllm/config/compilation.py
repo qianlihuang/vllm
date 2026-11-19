@@ -956,6 +956,10 @@ class CompilationConfig:
     static_all_moe_layers: list[str] = field(default_factory=list, init=False)
     """The names of all the MOE layers in the model
     """
+    _auto_disabled_custom_ops: bool = field(default=False, init=False, repr=False)
+    """Internal flag tracking whether `'none'` was auto-appended to `custom_ops`."""
+    _auto_enabled_ir_torch_wrap: bool = field(default=False, init=False, repr=False)
+    """Internal flag tracking whether `ir_enable_torch_wrap` was auto-enabled."""
 
     # Attention ops; used for piecewise cudagraphs
     # Use PyTorch operator format: "namespace::name"
@@ -1005,6 +1009,8 @@ class CompilationConfig:
             "enabled_custom_ops",
             "disabled_custom_ops",
             "static_forward_context",
+            "_auto_disabled_custom_ops",
+            "_auto_enabled_ir_torch_wrap",
         }
 
         return get_compile_factors(self, ignored_factors)

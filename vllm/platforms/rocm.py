@@ -1422,7 +1422,10 @@ class RocmPlatform(Platform):
 
     @classmethod
     def get_default_ir_op_priority(
-        cls, vllm_config: "VllmConfig"
+        cls,
+        vllm_config: "VllmConfig",
+        *,
+        use_inductor: bool | None = None,
     ) -> "IrOpPriorityConfig":
         from vllm._aiter_ops import rocm_aiter_ops
         from vllm.config.compilation import CompilationMode, CUDAGraphMode
@@ -1432,7 +1435,11 @@ class RocmPlatform(Platform):
         # use vllm_c kernels where available when no codegen
         # TODO(luka/TJ) use aiter, vllm_c, native by default on ROCm
         cc = vllm_config.compilation_config
-        using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+        using_inductor = (
+            cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+            if use_inductor is None
+            else use_inductor
+        )
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
         #  Aiter rms norm perform best when CUDA Graph capture is enabled.

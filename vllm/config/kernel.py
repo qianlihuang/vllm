@@ -485,6 +485,13 @@ class KernelConfig:
     experts' scales on each call, which saves memory (2.57 GiB on
     Qwen3.8-Flash-Next-FP4-Local) at some latency at higher batch sizes."""
 
+    _platform_defaults_applied: bool = Field(default=False, init=False, repr=False)
+    """Internal flag tracking whether `set_platform_defaults` has run once."""
+    _user_ir_op_priority_ops: set[str] = Field(
+        default_factory=set, init=False, repr=False
+    )
+    """Internal set of IR op names explicitly overridden by the user."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -525,6 +532,8 @@ class KernelConfig:
             "enable_flashinfer_mm_encoder_autotune",
             "enable_rocm_segmented_attn_autotune",
             "enable_rocm_aiter_gemm_warmup",
+            "_platform_defaults_applied",
+            "_user_ir_op_priority_ops",
         }
         if self.linear_backend_per_quant is None:
             ignored_factors.add("linear_backend_per_quant")
@@ -561,6 +570,8 @@ class KernelConfig:
         )
         for op_name, op_priority in asdict(platform_op_priority).items():
             current_op_priority: list[str] = getattr(self.ir_op_priority, op_name)
+            if not self._platform_defaults_applied and current_op_priority:
+                self._user_ir_op_priority_ops.add(op_name)
             if current_op_priority is None:
                 setattr(self.ir_op_priority, op_name, op_priority)
             else:
@@ -571,8 +582,37 @@ class KernelConfig:
                     op for op in op_priority if op not in current_op_priority
                 ]
                 current_op_priority.extend(unique_op_priority)
+        self._platform_defaults_applied = True
 
         logger.info(
             "Final IR op priority after setting platform defaults: %s",
             self.ir_op_priority,
         )
+
+    def fallback_ir_op_priority_to_eager(self, vllm_config: "VllmConfig") -> bool:
+        """Fall back platform-defaulted IR op priorities from Inductor-native
+        to eager fused kernels when the loaded model has no compiled submodules.
+
+        User-specified op priorities are preserved verbatim.
+        """
+        from vllm.platforms import current_platform
+
+        eager_op_priority = current_platform.get_default_ir_op_priority(
+            vllm_config, use_inductor=False
+        )
+        changed = False
+        for op_name, op_priority in asdict(eager_op_priority).items():
+            if op_name in self._user_ir_op_priority_ops:
+                continue
+            current_op_priority: list[str] = getattr(self.ir_op_priority, op_name)
+            if current_op_priority != op_priority:
+                setattr(self.ir_op_priority, op_name, list(op_priority))
+                changed = True
+        if changed:
+            self.ir_op_priority.set_default()
+            logger.info_once(
+                "Loaded model has no compiled submodules; falling back IR op "
+                "priority to eager defaults: %s",
+                str(self.ir_op_priority),
+            )
+        return changed

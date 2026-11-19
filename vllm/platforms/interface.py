@@ -1650,7 +1650,10 @@ class Platform:
 
     @classmethod
     def get_default_ir_op_priority(
-        cls, vllm_config: "VllmConfig"
+        cls,
+        vllm_config: "VllmConfig",
+        *,
+        use_inductor: bool | None = None,
     ) -> "IrOpPriorityConfig":
         """Get the default IR op priority for the current platform."""
         from vllm.config.kernel import IrOpPriorityConfig

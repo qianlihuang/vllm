@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+import vllm.ir
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -40,7 +41,11 @@ from vllm.compilation.wrapper import (
     compile_model_with_stock_torch,
     remove_bytecode_hooks,
 )
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import (
+    VllmConfig,
+    get_cached_compilation_config,
+    set_current_vllm_config,
+)
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
@@ -53,6 +58,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -398,6 +404,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
 
+    def _maybe_fallback_eager_ops_for_uncompiled_model(self) -> None:
+        """Fall back Inductor-only op defaults when no submodule uses torch.compile.
+
+        Under `VLLM_COMPILE` with `backend="inductor"`, vLLM defaults IR ops
+        (RMSNorm, RoPE) to `["native"]` and disables `CustomOp`s (such as
+        `SiluAndMul`) so Inductor can fuse them. When the loaded model (and any
+        loaded speculator) has no `@support_torch_compile` submodule, Inductor
+        never runs and those defaults fall through to unfused PyTorch eager
+        kernels. Revert auto-selected defaults back to fused kernels while
+        preserving any explicit user overrides.
+        """
+        cc = self.compilation_config
+        if cc.mode != CompilationMode.VLLM_COMPILE or cc.backend != "inductor":
+            return
+        models: list[nn.Module] = [self.model]
+        spec_model = getattr(self.speculator, "model", None)
+        if isinstance(spec_model, nn.Module):
+            models.append(spec_model)
+        if any(has_compiled_submodule(m) for m in models):
+            return
+
+        self.vllm_config.kernel_config.fallback_ir_op_priority_to_eager(
+            self.vllm_config
+        )
+        if cc._auto_enabled_ir_torch_wrap:
+            cc.ir_enable_torch_wrap = False
+            vllm.ir.set_default_torch_wrap(False)
+        if cc._auto_disabled_custom_ops and "none" in cc.custom_ops:
+            cc.custom_ops = ["all" if op == "none" else op for op in cc.custom_ops]
+            cc.enabled_custom_ops.clear()
+            cc.disabled_custom_ops.clear()
+            get_cached_compilation_config.cache_clear()
+            with set_current_vllm_config(self.vllm_config):
+                for model in models:
+                    for module in model.modules():
+                        if isinstance(module, CustomOp):
+                            module.redispatch_forward()
+            logger.info_once(
+                "Loaded model has no compiled submodules; re-enabling default "
+                "custom ops (%s).",
+                tuple(cc.custom_ops),
+            )
+
     def load_model(
         self,
         load_dummy_weights: bool = False,
@@ -457,6 +506,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             format_gib(m.consumed_memory),
             time_after_load - time_before_load,
         )
+        self._maybe_fallback_eager_ops_for_uncompiled_model()
 
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device

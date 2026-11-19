@@ -1919,10 +1919,12 @@ class VllmConfig:
 
         # By default, enable torch wrapping only when using custom Inductor lowering
         if self.compilation_config.ir_enable_torch_wrap is None:
-            self.compilation_config.ir_enable_torch_wrap = (
+            auto_wrap = (
                 self.compilation_config.mode == CompilationMode.VLLM_COMPILE
                 and self.compilation_config.backend == "inductor"
             )
+            self.compilation_config.ir_enable_torch_wrap = auto_wrap
+            self.compilation_config._auto_enabled_ir_torch_wrap = auto_wrap
 
         if all(s not in self.compilation_config.custom_ops for s in ("all", "none")):
             if (
@@ -1930,6 +1932,7 @@ class VllmConfig:
                 and self.compilation_config.mode != CompilationMode.NONE
             ):
                 self.compilation_config.custom_ops.append("none")
+                self.compilation_config._auto_disabled_custom_ops = True
             else:
                 self.compilation_config.custom_ops.append("all")
 

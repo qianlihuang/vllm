@@ -128,7 +128,13 @@ class CustomOp(nn.Module):
     def __init__(self, *, enforce_enable: bool = False, compile_native: bool = False):
         super().__init__()
         self._enforce_enable = enforce_enable
+        self._compile_native = compile_native
         self._forward_method = self.dispatch_forward(compile_native=compile_native)
+
+    def redispatch_forward(self) -> None:
+        self._forward_method = self.dispatch_forward(
+            compile_native=self._compile_native
+        )
 
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
