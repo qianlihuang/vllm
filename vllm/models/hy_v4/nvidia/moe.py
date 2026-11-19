@@ -96,6 +96,7 @@ class HYV4MoEFused(nn.Module):
         routed_hidden_size: int | None = None,
         routed_input_transform: nn.Module | None = None,
         routed_output_transform: nn.Module | None = None,
+        separate_shared_experts: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -165,10 +166,11 @@ class HYV4MoEFused(nn.Module):
             topk_group=1,
             routed_scaling_factor=router_scaling_factor,
             e_score_correction_bias=self.expert_bias,
-            shared_experts=self.shared_experts,
+            shared_experts=None if separate_shared_experts else self.shared_experts,
             swiglu_limit=moe_swiglu_limit,
             reduce_results=reduce_results,
         )
+        self.separate_shared_experts = separate_shared_experts
         assert reduce_results or self.experts.moe_config.skip_final_all_reduce
         mapping = self.experts.routed_experts.expert_map_manager
         self.ep_size, self.ep_rank = mapping.ep_size, mapping.ep_rank
