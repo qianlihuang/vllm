@@ -253,6 +253,7 @@ class HYV4Model(nn.Module):
 
     decoder_layer_cls: type[HYV4DecoderLayer] = HYV4DecoderLayer
     supports_ihc_sequence_parallel = True
+    supports_ihc_sequence_parallel_passthrough = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -291,7 +292,10 @@ class HYV4Model(nn.Module):
             and parallel_config.pipeline_parallel_size == 1
             and parallel_config.prefill_context_parallel_size == 1
             and parallel_config.decode_context_parallel_size == 1
-            and parallel_config.all2all_backend != "passthrough"
+            and (
+                parallel_config.all2all_backend != "passthrough"
+                or self.supports_ihc_sequence_parallel_passthrough
+            )
             and vllm_config.lora_config is None
             and not envs.VLLM_BATCH_INVARIANT
             and (

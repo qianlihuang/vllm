@@ -16,6 +16,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
 from vllm.models.deepseek_v41.common.engram import NgramHashState
 from vllm.models.qwen4_exp.common.ngram_embedding import (
     _lookup_ple_embedding_from_pinned_kernel,
@@ -423,11 +424,16 @@ class FlashEngram(nn.Module):
             hidden.dtype
         )
         x = x.flatten(1)
+        use_sp = hidden.shape[0] < hashes.shape[0]
         gates = []
         for channel in range(self.hc_mult):
             key = self.key_projs[channel](x)
             if local.tp_size > 1:
-                key = tensor_model_parallel_all_reduce(key)
+                key = (
+                    sp_reduce_scatter(key)
+                    if use_sp
+                    else tensor_model_parallel_all_reduce(key)
+                )
             gate = (
                 self.norm_key[channel](key)
                 * self.norm_query[channel](hidden[:, channel])
@@ -437,7 +443,11 @@ class FlashEngram(nn.Module):
         gate = torch.stack(gates, dim=1)
         value = self.value_proj(x)
         if local.tp_size > 1:
-            value = tensor_model_parallel_all_reduce(value)
+            value = (
+                sp_reduce_scatter(value)
+                if use_sp
+                else tensor_model_parallel_all_reduce(value)
+            )
         value = value.float()
         signal = (
             self.unified_pre_gamma.float()
@@ -448,4 +458,12 @@ class FlashEngram(nn.Module):
         result = ((gate.float().unsqueeze(-1) + scales) * signal.unsqueeze(1)).to(
             hidden.dtype
         )
-        return hidden + result.masked_fill((hashes < 0).all(-1)[:, None, None], 0)
+        invalid = (hashes < 0).all(-1)
+        if use_sp:
+            tp = local.tp_size
+            sp_pad = (-invalid.shape[0]) % tp
+            if sp_pad > 0:
+                invalid = torch.nn.functional.pad(invalid, (0, sp_pad), value=True)
+            chunk = invalid.shape[0] // tp
+            invalid = invalid[self.rank * chunk : (self.rank + 1) * chunk]
+        return hidden + result.masked_fill(invalid[:, None, None], 0)

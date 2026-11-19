@@ -32,8 +32,19 @@ class HYV4FlashAttention(HYV4MLAAttention):
     kv_a_proj_with_mqa: ReplicatedLinear
     linear_gate: ColumnParallelLinear
 
-    def __init__(self, vllm_config, config, layer_idx, topk_indices_buffer, prefix):
+    def __init__(
+        self,
+        vllm_config,
+        config,
+        layer_idx,
+        topk_indices_buffer,
+        prefix,
+        *,
+        reduce_results: bool = True,
+        apply_post_norm: bool = True,
+    ):
         nn.Module.__init__(self)
+        self.apply_post_norm = apply_post_norm
         self.is_window_layer = config.layer_types[layer_idx] == SLIDING_ATTENTION
         self.config = deepcopy(config)
         self.config.rope_parameters = config.rope_for_layer(layer_idx)
@@ -141,6 +152,7 @@ class HYV4FlashAttention(HYV4MLAAttention):
             config.hidden_size,
             bias=False,
             quant_config=quant,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
         self.rotary_emb = get_rope(
@@ -228,4 +240,6 @@ class HYV4FlashAttention(HYV4MLAAttention):
         else:
             out = out * torch.sigmoid(self.linear_gate(hidden_states)[0])
         out = self.o_proj(out)[0]
-        return self.post_proj_norm(out) if self.post_proj_norm is not None else out
+        if self.apply_post_norm and self.post_proj_norm is not None:
+            return self.post_proj_norm(out)
+        return out
