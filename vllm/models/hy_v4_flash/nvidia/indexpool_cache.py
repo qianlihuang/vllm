@@ -5,6 +5,7 @@
 from dataclasses import dataclass, replace
 from math import lcm
 
+import numpy as np
 import torch
 
 from vllm.config import get_current_vllm_config
@@ -15,6 +16,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
     KpoolTailBackend,
 )
+from vllm.v1.attention.ops.shardq import build_shardq_split
 from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     FullAttentionManager,
@@ -24,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SparseCacheRole,
 )
+from vllm.v1.utils import CpuGpuBuffer
 
 POOL_PAGE_SIZE = 64
 
@@ -35,6 +38,7 @@ class IndexPoolMetadata:
     block_table: torch.Tensor
     num_actual_tokens: int
     max_seq_len: int
+    shardq_gather_indices: torch.Tensor | None = None
 
 
 class IndexPoolMetadataBuilder(AttentionMetadataBuilder[IndexPoolMetadata]):
@@ -42,16 +46,40 @@ class IndexPoolMetadataBuilder(AttentionMetadataBuilder[IndexPoolMetadata]):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.vllm_config = vllm_config
         self.max_model_len = vllm_config.model_config.max_model_len
+        layers = vllm_config.compilation_config.static_forward_context
+        self.use_shardq = any(
+            getattr(layers.get(name), "use_shardq", False) for name in layer_names
+        )
+        if self.use_shardq:
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self.shardq_gather_indices = CpuGpuBuffer(
+                max_tokens,
+                dtype=torch.int64,
+                device=device,
+                pin_memory=torch.device(device).type == "cuda",
+            )
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         cm = common_attn_metadata
+        shardq_gather_indices = None
+        if (
+            self.use_shardq
+            and (split := build_shardq_split(cm, self.vllm_config)) is not None
+        ):
+            d = split.num_decode_tokens
+            n = d + len(split.local_token_ids)
+            self.shardq_gather_indices.np[:d] = np.arange(d, dtype=np.int64)
+            self.shardq_gather_indices.np[d:n] = split.local_token_ids + d
+            shardq_gather_indices = self.shardq_gather_indices.copy_to_gpu(n)
         return IndexPoolMetadata(
             query_start_loc=cm.query_start_loc[: cm.num_reqs + 1],
             seq_lens=cm.seq_lens[: cm.num_reqs],
             block_table=cm.block_table_tensor[: cm.num_reqs],
             num_actual_tokens=cm.num_actual_tokens,
             max_seq_len=cm.max_seq_len,
+            shardq_gather_indices=shardq_gather_indices,
         )
 
     def build_for_cudagraph_capture(self, common_attn_metadata):

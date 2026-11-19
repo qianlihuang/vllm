@@ -163,6 +163,10 @@ class HYV4FlashAttention(HYV4MLAAttention):
             self.num_local_heads, torch.float32
         )
         self._force_sparse_mqa()
+        runner_spec = getattr(
+            vllm_config, "runner_speculative_config", vllm_config.speculative_config
+        )
+        dfly_active = runner_spec is not None and runner_spec.method == "dfly"
         self.mla_attn = MLAAttention(
             num_heads=self.num_local_heads,
             scale=self.scaling,
@@ -183,7 +187,12 @@ class HYV4FlashAttention(HYV4MLAAttention):
             else FlashSparseBackend,
             sliding_window=config.sliding_window if self.is_window_layer else None,
             sinks=self.learnable_sink_param,
+            shardq_eligible=not dfly_active,
         )
+        if self.mla_attn.use_shardq and isinstance(
+            self.indexer, FlashCompressedIndexer
+        ):
+            self.indexer.k_cache.use_shardq = True
         self.post_proj_norm = (
             RMSNorm(config.hidden_size, config.rms_norm_eps)
             if config.sandwich_norm

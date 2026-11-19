@@ -81,14 +81,32 @@ class FlashWindowIndexer(nn.Module):
         meta: Any = metadata[self.attention_prefix]
         if meta.num_actual_tokens == 0 or meta.seq_lens.numel() == 0:
             return output.fill_(-1)
-        rows = torch.arange(output.shape[0], device=output.device)
+        shardq = getattr(meta, "shardq", None)
+        if shardq is not None:
+            d = shardq.num_decode_tokens
+            local_ids = shardq.local_token_ids
+            if d > 0:
+                rows = torch.cat(
+                    (
+                        torch.arange(d, device=output.device, dtype=local_ids.dtype),
+                        local_ids + d,
+                    )
+                )
+            else:
+                rows = local_ids
+            out_view = output[: rows.numel()]
+        else:
+            rows = torch.arange(output.shape[0], device=output.device)
+            out_view = output
         starts = meta.query_start_loc
         requests = torch.searchsorted(starts[1:], rows, right=True)
         requests = requests.clamp_max(starts.numel() - 2).long()
         logical = meta.seq_lens[requests] - (starts[requests + 1] - starts[requests])
         logical = logical + rows - starts[requests]
         live = (rows < meta.num_actual_tokens) & (rows < starts[-1])
-        output.copy_(
-            window_indices(torch.where(live, logical, -1), self.window, output.shape[1])
+        out_view.copy_(
+            window_indices(
+                torch.where(live, logical, -1), self.window, out_view.shape[1]
+            )
         )
         return output

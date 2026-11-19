@@ -144,22 +144,39 @@ class FlashCompressedIndexer(nn.Module):
         write_tails(
             keys, positions, tail, tm.block_table, km.query_start_loc, km.seq_lens
         )
-        query = self.query_projection(q_c)[0][:tokens].reshape(
-            tokens, self.num_heads, 128
+        rows = km.shardq_gather_indices
+        if rows is not None:
+            score_tokens = rows.numel()
+            q_c_score = q_c.index_select(0, rows)
+            hidden_score = hidden_states.index_select(0, rows)
+            pos_score = positions.index_select(-1, rows)
+            owner_score = owner.index_select(0, rows)
+            logical_score = logical.index_select(0, rows)
+            upper_score = upper.index_select(0, rows)
+            live_score = live.index_select(0, rows)
+        else:
+            score_tokens = tokens
+            q_c_score = q_c[:tokens]
+            hidden_score = hidden_states[:tokens]
+            pos_score = positions[..., :tokens]
+            owner_score = owner
+            logical_score = logical
+            upper_score = upper
+            live_score = live
+        query = self.query_projection(q_c_score)[0].reshape(
+            score_tokens, self.num_heads, 128
         )
-        query = rotate_indexer(
-            query, positions[..., :tokens], self.rope_dim, self.rope_parameters
-        )
+        query = rotate_indexer(query, pos_score, self.rope_dim, self.rope_parameters)
         quant_q, scales_q = fwht_quantize(query.reshape(-1, 128).bfloat16())
         heads = 32 if self.num_heads <= 32 else 64
         quant_q = F.pad(
-            quant_q.view(torch.uint8).reshape(tokens, self.num_heads, 128),
+            quant_q.view(torch.uint8).reshape(score_tokens, self.num_heads, 128),
             (0, 0, 0, heads - self.num_heads),
         ).view(torch.float8_e4m3fn)
-        weights = self.head_weight_projection(hidden_states)[0][:tokens].float()
+        weights = self.head_weight_projection(hidden_score)[0].float()
         weights = weights * (self.num_heads**-0.5 * 128**-0.5)
         weights = F.pad(
-            weights * scales_q.reshape(tokens, self.num_heads),
+            weights * scales_q.reshape(score_tokens, self.num_heads),
             (0, heads - self.num_heads),
         )
         quant_q = quant_q[:, None]
@@ -176,15 +193,15 @@ class FlashCompressedIndexer(nn.Module):
         if self.logits_budget < width:
             raise ValueError("IndexPool logits budget cannot hold a single scoring row")
         chunk = max(1, self.logits_budget // width)
-        for begin in range(0, tokens, chunk):
-            end = min(tokens, begin + chunk)
-            bounds = upper[begin:end]
+        for begin in range(0, score_tokens, chunk):
+            end = min(score_tokens, begin + chunk)
+            bounds = upper_score[begin:end]
             lengths = bounds.clamp_min(1).int()[:, None].contiguous()
-            indices = owner[begin:end].int().contiguous() if self.varlen else None
+            indices = owner_score[begin:end].int().contiguous() if self.varlen else None
             schedule = get_paged_mqa_logits_metadata(
                 lengths, POOL_PAGE_SIZE, self.num_sms, indices=indices
             )
-            table = km.block_table[owner[begin:end]]
+            table = km.block_table[owner_score[begin:end]]
             logits = fp8_fp4_paged_mqa_logits(
                 (
                     quant_q[begin:end],
@@ -202,9 +219,9 @@ class FlashCompressedIndexer(nn.Module):
             output[begin:end].copy_(
                 expand_groups(
                     recalled,
-                    logical[begin:end],
+                    logical_score[begin:end],
                     self.ratio,
-                    active=live[begin:end],
+                    active=live_score[begin:end],
                 )
             )
         return output
