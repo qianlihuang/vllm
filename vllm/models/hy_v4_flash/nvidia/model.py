@@ -23,8 +23,10 @@ from vllm.models.hy_v4.nvidia.model import (
 from vllm.models.hy_v4_flash.configs import HYV4FlashConfig
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.math_utils import round_up
 
 from .moe import HYV4FlashFeedForward, HYV4FlashMoE
+from .swa import FlashWindowIndexer
 
 _EXPERT_WEIGHT = re.compile(
     r"(.*\.experts)\.(?:(\d+)\.)?(gate_proj|up_proj|down_proj|gate_up_proj)"
@@ -131,6 +133,26 @@ class HYV4FlashModel(HYV4Model):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.swa_topk_indices_buffer: torch.Tensor | None = None
+        swa_layers = [
+            layer
+            for layer in self.layers
+            if isinstance(layer, HYV4FlashDecoderLayer)
+            and layer.self_attn.is_window_layer
+        ]
+        if swa_layers and self.topk_indices_buffer is not None:
+            width = round_up(self.config.sliding_window, 128)
+            self.swa_topk_indices_buffer = torch.empty(
+                (self.topk_indices_buffer.shape[0], width),
+                dtype=self.topk_indices_buffer.dtype,
+                device=self.topk_indices_buffer.device,
+            )
+            for idx, layer in enumerate(swa_layers):
+                indexer = layer.self_attn.indexer
+                assert isinstance(indexer, FlashWindowIndexer)
+                indexer.topk_indices_buffer = self.swa_topk_indices_buffer
+                indexer.reuse_cached_indices = idx > 0
+                layer.self_attn.topk_indices_buffer = self.swa_topk_indices_buffer
         self.loaded_parts: dict[str, set[Any]] = {}
         self.engram_hash = None
         if self.config.engram_layer_ids:
