@@ -84,6 +84,11 @@ def test_build_shardq_split_after_indexer_decodes(monkeypatch, num_spec):
     assert split.num_tokens_per_rank.sum() == 9100
     hf_config.index_topk = 5300
     assert build_shardq_split(metadata, vllm_config) is None
+    attention_config.sparse_mla_force_mqa = True
+    forced_split = build_shardq_split(metadata, vllm_config)
+    assert forced_split is not None
+    assert forced_split.num_tokens_per_rank.sum() == 9100
+    attention_config.sparse_mla_force_mqa = False
     hf_config.index_topk = 5299
     attention_config.sparse_mla_shard_q_min_tokens = 9101
     assert build_shardq_split(metadata, vllm_config) is None

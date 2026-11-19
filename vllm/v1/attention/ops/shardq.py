@@ -125,7 +125,10 @@ def build_shardq_split(
     seq_lens = common_attn_metadata.seq_lens_cpu_upper_bound
     assert seq_lens is not None
     topk_tokens = vllm_config.model_config.hf_text_config.index_topk
-    if int(seq_lens[num_decodes:num_reqs].max()) <= topk_tokens:
+    if (
+        not getattr(vllm_config.attention_config, "sparse_mla_force_mqa", False)
+        and int(seq_lens[num_decodes:num_reqs].max()) <= topk_tokens
+    ):
         return None
     query_lens = common_attn_metadata.query_start_loc_cpu.diff()
     prefill_lens = query_lens[num_decodes:num_reqs].numpy()
@@ -215,8 +218,9 @@ class ShardQWorkspace(DirectCPWorkspace):
         self.handle = self._allocations[0][1]
 
 
-# Shared by every ShardQ layer; without it the exchanges use NCCL.
-_workspace: ShardQWorkspace | None = None
+# Shared by every ShardQ layer of a given local head count; without it the
+# exchanges use NCCL.
+_workspaces: dict[int, ShardQWorkspace] = {}
 
 
 def allocate_shardq_buffers(
@@ -234,9 +238,8 @@ def allocate_shardq_buffers(
         "token (sparse_mla_shard_q).",
         vllm_config.attention_config.sparse_mla_shard_q_min_tokens,
     )
-    global _workspace
     group = get_tp_group()
-    if _workspace is not None or not direct_cp_enabled(group, torch.bfloat16, None):
+    if num_heads in _workspaces or not direct_cp_enabled(group, torch.bfloat16, None):
         return
     max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     # A rank owns at most two chunks of ceil(n / (2 * world)) per request.
@@ -248,7 +251,7 @@ def allocate_shardq_buffers(
     device = torch.device(
         current_platform.device_type, torch.accelerator.current_device_index()
     )
-    _workspace = ShardQWorkspace(
+    _workspaces[num_heads] = ShardQWorkspace(
         group.device_group,
         device,
         num_ubatches,
@@ -289,7 +292,8 @@ def shard_q(
     group = get_tp_group()
     world = group.world_size
     num_local = metadata.num_tokens_per_rank[group.rank_in_group]
-    if _workspace is None:
+    workspace = _workspaces.get(heads)
+    if workspace is None:
         # Every rank sends this rank its num_local tokens, in rank order.
         recv = q.new_empty((world, num_local, heads, dim))
         _all_to_all(
@@ -299,12 +303,12 @@ def shard_q(
             None,
         )
         return decode_q, torch.cat(list(recv), dim=1)
-    storage, peer_ptrs = _workspace.q
+    storage, peer_ptrs = workspace.q
     assert storage.shape[2:] == (world * heads, dim)
     ubatch = dbo_current_ubatch_id()
     width = heads * dim
     # Peers may still read the previous exchange from their buffers.
-    _workspace.handle.barrier(channel=ubatch)
+    workspace.handle.barrier(channel=ubatch)
     grid = (max(metadata.num_tokens_per_rank), world, triton.cdiv(width, _PUSH_BLOCK))
     _shard_q_kernel[grid](
         q,
@@ -317,7 +321,7 @@ def shard_q(
         width,
         BLOCK=_PUSH_BLOCK,
     )
-    _workspace.handle.barrier(channel=ubatch)
+    workspace.handle.barrier(channel=ubatch)
     # Views the buffer, which the next exchange reuses.
     return decode_q, storage[ubatch, :num_local]
 
@@ -332,7 +336,8 @@ def unshard_out(
     num_local, heads, dim = out.shape[0], out.shape[1] // world, out.shape[2]
     num_split_tokens = sum(metadata.num_tokens_per_rank)
     num_tokens = metadata.num_decode_tokens + num_split_tokens
-    if _workspace is None:
+    workspace = _workspaces.get(heads)
+    if workspace is None:
         # One block of heads per destination rank.
         send = torch.stack(out.chunk(world, dim=1))
         recv = out.new_empty((num_split_tokens, heads, dim))
@@ -340,11 +345,11 @@ def unshard_out(
         restored = out.new_empty((num_tokens, heads, dim))
         restored[metadata.num_decode_tokens :].index_copy_(0, metadata.token_ids, recv)
     else:
-        storage, peer_ptrs = _workspace.out
+        storage, peer_ptrs = workspace.out
         assert storage.shape[2:] == (heads, dim)
         ubatch = dbo_current_ubatch_id()
         width = heads * dim
-        _workspace.handle.barrier(channel=ubatch)
+        workspace.handle.barrier(channel=ubatch)
         _unshard_out_kernel[(num_local * world, triton.cdiv(width, _PUSH_BLOCK))](
             out,
             out.stride(0),
@@ -355,7 +360,7 @@ def unshard_out(
             width,
             BLOCK=_PUSH_BLOCK,
         )
-        _workspace.handle.barrier(channel=ubatch)
+        workspace.handle.barrier(channel=ubatch)
         # Views the buffer, which the next exchange reuses.
         restored = storage[ubatch, :num_tokens]
     if decode_out is not None:
