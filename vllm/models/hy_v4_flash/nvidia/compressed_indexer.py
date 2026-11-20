@@ -86,10 +86,9 @@ class FlashCompressedIndexer(nn.Module):
 
     def forward(self, hidden_states, q_c, positions, rope=None):
         output = self.topk_indices_buffer[: hidden_states.shape[0]]
-        output.fill_(-1)
         metadata = get_forward_context().attn_metadata
         if metadata is None:
-            return output
+            return output.fill_(-1)
         if not isinstance(metadata, dict):
             raise TypeError("IndexPool requires per-layer metadata")
         km = metadata[self.k_cache.prefix]
@@ -100,7 +99,9 @@ class FlashCompressedIndexer(nn.Module):
             raise TypeError("IndexPool cache metadata has an incompatible type")
         tokens = km.num_actual_tokens
         if tokens == 0 or km.seq_lens.numel() == 0:
-            return output
+            return output.fill_(-1)
+        if tokens < output.shape[0]:
+            output[tokens:].fill_(-1)
         keys = self.token_key_norm(
             self.token_key_projection(hidden_states)[0]
         ).bfloat16()
@@ -199,12 +200,11 @@ class FlashCompressedIndexer(nn.Module):
                 indices=indices,
             )
             recalled = select_groups(logits, bounds, self.group_budget)
-            output[begin:end].copy_(
-                expand_groups(
-                    recalled,
-                    logical[begin:end],
-                    self.ratio,
-                    active=live[begin:end],
-                )
+            expand_groups(
+                recalled,
+                logical[begin:end],
+                self.ratio,
+                active=live[begin:end],
+                out=output[begin:end],
             )
         return output

@@ -5,11 +5,13 @@
 import torch
 import torch.nn.functional as F
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
 from vllm.triton_utils import tl, triton
 
 INDEX_DIM = 128
 FP8_MAX = 448.0
+_CUDA_TOPK_MAX_BUDGET = 2048
 
 
 def fwht_quantize(vectors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -74,7 +76,97 @@ def rotate_indexer(x, positions, rope_dim, parameters):
     return torch.cat((nope, rotated.to(x.dtype)), dim=-1)
 
 
-def expand_groups(group_ids, positions, ratio, active=None):
+@triton.jit
+def _expand_groups_kernel(
+    Out,
+    GroupIds,
+    Positions,
+    Active,
+    OUT_STRIDE,
+    G_STRIDE,
+    POS_STRIDE,
+    ACT_STRIDE,
+    BUDGET: tl.constexpr,
+    RATIO: tl.constexpr,
+    OUT_WIDTH: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    HAS_ACTIVE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    pos = tl.load(Positions + row * POS_STRIDE).to(tl.int32)
+    live = pos >= 0
+    if HAS_ACTIVE:
+        live = live & (tl.load(Active + row * ACT_STRIDE) != 0)
+    upper = tl.where(live, pos // RATIO, 0)
+
+    offs = tl.arange(0, BLOCK_B)
+    in_budget = offs < BUDGET
+    g = tl.load(GroupIds + row * G_STRIDE + offs, mask=in_budget, other=-1).to(tl.int32)
+    valid = live & in_budget & (g >= 0) & (g < upper)
+    dst_g = tl.cumsum(valid.to(tl.int32), axis=0) - 1
+    n_valid = tl.sum(valid.to(tl.int32), axis=0)
+
+    tail_len = tl.where(live, pos - upper * RATIO + 1, 0)
+    total_valid = n_valid * RATIO + tail_len
+
+    out_row = Out + row * OUT_STRIDE
+    for base in tl.static_range(0, OUT_WIDTH, BLOCK_B):
+        cols = base + offs
+        mask = (cols >= total_valid) & (cols < OUT_WIDTH)
+        tl.store(out_row + cols, -1, mask=mask)
+
+    for r in tl.static_range(RATIO):
+        tl.store(out_row + dst_g * RATIO + r, g * RATIO + r, mask=valid)
+
+    r_offs = tl.arange(0, RATIO)
+    t_vals = upper * RATIO + r_offs
+    t_valid = live & (t_vals <= pos)
+    tl.store(out_row + n_valid * RATIO + r_offs, t_vals, mask=t_valid)
+
+
+def expand_groups(group_ids, positions, ratio, active=None, out=None):
+    rows, budget = group_ids.shape
+    out_width = (budget + 1) * ratio
+    if (
+        group_ids.is_cuda
+        and ratio > 0
+        and (ratio & (ratio - 1)) == 0
+        and budget > 0
+        and triton.next_power_of_2(budget) <= _CUDA_TOPK_MAX_BUDGET
+        and group_ids.stride(-1) == 1
+        and (
+            out is None
+            or (
+                out.is_cuda
+                and out.dtype == torch.int32
+                and out.shape == (rows, out_width)
+                and out.stride(-1) == 1
+            )
+        )
+    ):
+        if out is None:
+            out = torch.empty(
+                (rows, out_width), device=group_ids.device, dtype=torch.int32
+            )
+        if rows == 0:
+            return out
+        _expand_groups_kernel[(rows,)](
+            out,
+            group_ids,
+            positions,
+            active if active is not None else positions,
+            out.stride(0),
+            group_ids.stride(0),
+            positions.stride(0),
+            active.stride(0) if active is not None else positions.stride(0),
+            BUDGET=budget,
+            RATIO=ratio,
+            OUT_WIDTH=out_width,
+            BLOCK_B=triton.next_power_of_2(budget),
+            HAS_ACTIVE=active is not None,
+        )
+        return out
+
     offsets = torch.arange(ratio, device=group_ids.device)
     upper = positions // ratio
     live = positions >= 0
@@ -92,10 +184,37 @@ def expand_groups(group_ids, positions, ratio, active=None):
         valid.long().cumsum(-1) - 1,
         valid.sum(-1, keepdim=True) + (~valid).long().cumsum(-1) - 1,
     )
-    return torch.empty_like(candidates).scatter(-1, destinations, candidates)
+    result = torch.empty_like(candidates).scatter(-1, destinations, candidates)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
-def select_groups(logits, upper, budget):
+def select_groups(logits, upper, budget, *, sorted_output: bool = False):
+    if (
+        not sorted_output
+        and logits.is_cuda
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and 0 < budget <= _CUDA_TOPK_MAX_BUDGET
+        and logits.shape[0] > 0
+    ):
+        num_rows = logits.shape[0]
+        row_ends = upper.clamp(0, logits.shape[1]).to(torch.int32).contiguous()
+        out = torch.empty((num_rows, budget), device=logits.device, dtype=torch.int32)
+        ops.top_k_per_row_decode(
+            logits,
+            1,
+            row_ends,
+            out,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            budget,
+        )
+        return out
+
     columns = torch.arange(logits.shape[1], device=logits.device)
     scores = logits.masked_fill(columns[None] >= upper[:, None], -torch.inf)
     count = min(budget, logits.shape[1])
